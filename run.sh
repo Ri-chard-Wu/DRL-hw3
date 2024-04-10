@@ -1,0 +1,1 @@
+xvfb-run -s "-screen 0 1400x900x24" python 111022533_hw3_train.py
