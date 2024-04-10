@@ -38,6 +38,12 @@ a_min = np.array([-1.0,  0.0,  0.0])
 a_max = np.array([1.0, 1.0, 1.0])
 
  
+  
+
+class AttrDict(dict):
+    def __getattr__(self, a):
+        return self[a]
+ 
 
 
 
@@ -61,9 +67,8 @@ para = AttrDict({
     'batch_size': 128,
     'n_envs': 8,
 
-    'save_period': 1000,
-    'eval_period': 200,
-    'log_period': 200,
+    'save_period': 50,    
+    'log_period': 10,
 
     'ckpt_save_path': "ckpt/checkpoint0.h5",
     # 'ckpt_load_path': "ckpt/checkpoint1.h5"
@@ -125,9 +130,19 @@ def worker(remote, parent_remote, env_fn_wrapper):
             ob, reward, done, info = env.step(data)
             if done:
                 ob = env.reset()
-            remote.send((ob, reward, done, info))
+            ob = np.squeeze(ob)
+
+            # print(f'ob.shape: {ob.shape}, done: {done}')
+            # exit()
+
+            remote.send((ob, reward[0], done, info))
         elif cmd == 'reset':
             ob = env.reset()
+            ob = np.squeeze(ob)
+
+            # print(f'ob.shape: {np.squeeze(ob).shape}')
+            # exit()           
+
             remote.send(ob)
         elif cmd == 'render':
             remote.send(env.render(mode='rgb_array'))
@@ -175,17 +190,27 @@ class VecEnv():
         # for remote, action in zip(self.remotes, actions):
         #     remote.send(('step', action))
 
-        for i in range(len(self.remote)):
-            self.remotes.send(('step', actions[i]))
+        for i in range(len(self.remotes)):
+            self.remotes[i].send(('step', actions[i]))
         
         results = [remote.recv() for remote in self.remotes]
         obs, rews, dones, infos = zip(*results)
+
+        # print(f'np.stack(rews).shape: {np.stack(rews).shape}')
+        # exit()
+
         return np.stack(obs), np.stack(rews), np.stack(dones), infos
 
     def reset(self):
         for remote in self.remotes:
             remote.send(('reset', None))
-        return np.stack([remote.recv() for remote in self.remotes])
+
+        obs = np.stack([remote.recv() for remote in self.remotes])
+
+        # print(f'obs.shape: {obs.shape}')
+        # exit()
+
+        return obs
  
     def close(self):
         if self.closed:
@@ -231,16 +256,19 @@ class Agent(tf.keras.Model):
 
     def __init__(self):  
 
+        super().__init__()
+
         self.backbone = Backbone()
         self.flatten = tf.keras.layers.Flatten()
         self.a_mean_head = tf.keras.layers.Dense(units=num_actions, activation='tanh', name="a_mean_head")
-        self.a_std = self.add_weight("a_std", shape=[num_actions,], trainable=False
+        self.a_std = self.add_weight("a_std", shape=[num_actions,], trainable=False,
                       initializer = tf.keras.initializers.Constant(value=0.5), dtype=tf.float32)
         
         self.v_head = tf.keras.layers.Dense(units=1, name="v_head")
         self.update_counts = 0
         
-   
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=para.lr)
+
    
     @tf.function
     def call(self, x, training=False):
@@ -251,10 +279,10 @@ class Agent(tf.keras.Model):
 
         a_mean = a_min + ((a_mean + 1) / 2) * (a_max - a_min)
 
-        dist = tf.compat.v1.distributions.Normal(a_mean, self.a_std, validate_args=True)
+        # self.dist = tf.compat.v1.distributions.Normal(a_mean, self.a_std, validate_args=True)
 
 
-        return dist, tf.squeeze(v, axis=-1)
+        return a_mean, tf.squeeze(v, axis=-1)
 
      
 
@@ -262,12 +290,13 @@ class Agent(tf.keras.Model):
         
         state = tf.convert_to_tensor(state, tf.float32)         
         # a, a_logP, ent, v = self(state)
-        dist, v = self(state)
+        a_mean, v = self(state)
+
+        dist = tf.compat.v1.distributions.Normal(a_mean, self.a_std, validate_args=True)
 
         a = tf.squeeze(dist.sample(1)) # (b, num_actions)        
         a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,) 
-               
-
+                
         return a.numpy(), a_logP.numpy(), v.numpy()
  
 
@@ -293,7 +322,10 @@ class Agent(tf.keras.Model):
 
             eps = para.ppo_clip
  
-            dist, val = self(sta, True)
+            a_mean, val = self(sta, True)
+
+            dist = tf.compat.v1.distributions.Normal(a_mean, self.a_std, validate_args=True)
+
             a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,) 
             ent = dist.entropy()       
 
@@ -334,20 +366,19 @@ def preprocess_frame(img):
     img = img[:-12, 6:-6] # (84, 84, 3)
     img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140])
     img = img / 255.0
-    img = img * 2 - 1     
+    img = img * 2 - 1    
+    # print(f'img.shape: {img.shape}') 
     assert img.shape == (84, 84)
-    return im 
+    return img
+
+
 
 class VecBuf():
 
-    def __init__(self, n_envs):        
-
+    def __init__(self, n_envs):   
        
         self.n_envs = n_envs
-        self.n = 0
-         
-        self.stack = [deque(maxlen=para.k) for _ in range(para.n_envs)]
-        self.add_frame([np.zeros((*para.img_shape, 3)) for _ in n_envs])
+        self.n = 0 
          
         self.sta = np.zeros((para.horizon+1, n_envs, *para.img_shape, para.k))
         self.val = np.zeros((para.horizon+1, n_envs)) 
@@ -358,16 +389,30 @@ class VecBuf():
         self.adv = None
         self.ret = None
 
-    
+        self.stack = [deque(maxlen=para.k) for _ in range(para.n_envs)]
+        self.init_stack(np.ones((n_envs), dtype='bool'))
+
+
+    def init_stack(self, don):
+        for j in range(self.n_envs):
+            if(don[j]):
+                for _ in range(para.k): 
+                    self.stack[j].append(np.zeros(para.img_shape))
+            # print(f'len(self.stack[{i}]): {len(self.stack[i])}')
 
     def add_frame(self, frames):
         
         for i in range(self.n_envs):
+            # print(f'frames[i].shape: { frames[i].shape}')
             self.stack[i].append(preprocess_frame(frames[i]))
+
+            # print(f'len(self.stack[i]): {len(self.stack[i])}')
+
             self.sta[self.n, i] = np.stack(self.stack[i], axis=-1)
+
         self.n+=1
-        # return [sta for sta in self.sta[self.n, :]]
-        return self.sta[self.n, :] # (n_env, 84, 84, 4)
+        
+        return self.sta[self.n-1, :] # (n_env, 84, 84, 4)
  
     def add_value(self, val):
         self.val[self.n-1] = val # (n_env,)
@@ -378,6 +423,8 @@ class VecBuf():
         self.alg[idx] = alg
         self.rew[idx] = rew
         self.don[idx] = don
+
+        self.init_stack(don)
      
     def add_advantage(self, adv):
         
@@ -437,7 +484,7 @@ def compute_gae(rews, vals, masks, gamma, LAMBDA):
 
     for j in range(para.n_envs):
 
-        rew, val, mask = rews[:,i], vals[:,i], masks[:,i]
+        rew, val, mask = rews[:,j], vals[:,j], masks[:,j]
 
         gae = 0 
         for i in reversed(range(para.horizon)):
@@ -461,10 +508,9 @@ class Trainer():
         if('ckpt_load_path' in para): 
             self.agent.load_checkpoint(para.ckpt_load_path)
 
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=para.lr)
 
 
-    def train():    
+    def train(self):    
 
         env = VecEnv([make_env for _ in range(para.n_envs)])
         obs = env.reset()
@@ -477,15 +523,15 @@ class Trainer():
 
             buf = VecBuf(para.n_envs)
          
-            for _ in range(horizon): 
+            for _ in range(para.horizon): 
                 sta = buf.add_frame(obs) 
+                # print(f'buf.n: {buf.n}')
                 a, a_logP, value = self.agent.predict(sta) 
                 obs, reward, done, _ = env.step(a)
                 buf.add_value(value)
                 buf.add_effects(a, a_logP, reward, done)
-            
-                        
-            sta = buf.add_frame(obs)
+             
+            sta = buf.add_frame(obs) 
             buf.add_value(self.agent.predict(sta)[2])
 
             data = buf.get_data()
@@ -494,24 +540,22 @@ class Trainer():
             
 
             buf.flatten()
-
-            for _ in range(num_epochs):
-                buf.shuffle() 
-                
+            losses = []
+            for _ in range(para.epochs):
+                buf.shuffle()                 
                 for batch in buf.batch(): 
+                    losses.append(self.agent.train_step(batch))
 
-                    loss = self.agent.train_step(batch)
-                                    
-                    if self.agent.update_counts % para.save_period == 0:
-                        # self.agent.save_checkpoint(para.ckpt_save_path)
-                        self.agent.save_checkpoint(f"ckpt/checkpoint{t}.h5")
-                        
-                    
-                    if self.agent.update_counts % para.log_period == 0:
-                        log['cum_reward_mean'], log['cum_reward_std'] = \
-                                                self.compute_cum_reward(data.rew, data.don)
-                        log['loss'] = loss
-                        with open("log.txt", "a") as f: f.write(f't: {t}, ' + str(log) + '\n')
+
+            if t % para.save_period == 0:
+                self.agent.save_checkpoint(f"ckpt/checkpoint{t}.h5")
+                
+            
+            if t % para.log_period == 0:
+                log['cum_reward_mean'], log['cum_reward_std'] = \
+                                        self.compute_cum_reward(data.rew, data.don)
+                log['loss'] = np.mean(losses)
+                with open("log.txt", "a") as f: f.write(f't: {t}, ' + str(log) + '\n')
 
         
 
@@ -523,20 +567,20 @@ class Trainer():
         cum_reward = [0] * para.n_envs
         traj_len = [0] * para.n_envs
         
-		for i in range(para.horizon):
-			for j in range(para.n_envs):
+        for i in range(para.horizon):
+            for j in range(para.n_envs):
 
-				if don[i, j]:
+                if don[i, j]:
 
-					cum_rewards.append(cum_reward[j] + rew[i, j])
-					traj_lens.append(traj_len[j] + 1)
+                    cum_rewards.append(cum_reward[j] + rew[i, j])
+                    traj_lens.append(traj_len[j] + 1)
 
-					cum_reward[j] = 0
-					traj_len[j] = 0
+                    cum_reward[j] = 0
+                    traj_len[j] = 0
 
-				else:
-					cum_reward[j] += rew[i, j]
-					traj_len[j] += 1
+                else:
+                    cum_reward[j] += rew[i, j]
+                    traj_len[j] += 1
 
         return np.mean(cum_rewards), np.std(cum_rewards)
 
