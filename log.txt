@@ -1,1 +1,2 @@
-t: 0, {'cum_reward_mean': nan, 'cum_reward_std': nan, 'loss': 4.04186}
+t: 0, {'cum_reward_mean': 0, 'cum_reward_std': 0, 'loss': 2.5652738}
+t: 10, {'cum_reward_mean': 0, 'cum_reward_std': 0, 'loss': 2.3721642}

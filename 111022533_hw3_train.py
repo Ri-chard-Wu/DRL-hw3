@@ -67,7 +67,7 @@ para = AttrDict({
     'batch_size': 128,
     'n_envs': 8,
 
-    'save_period': 50,    
+    'save_period': 100,    
     'log_period': 10,
 
     'ckpt_save_path': "ckpt/checkpoint0.h5",
@@ -332,12 +332,18 @@ class Agent(tf.keras.Model):
             val_clip = val + tf.clip_by_value(val - val_old, 1-eps, 1+eps)
             val_loss1 = tf.square(ret - val) # (b,)
             val_loss2 = tf.square(ret - val_clip) # (b,)
-            val_loss = tf.reduce_mean(tf.maximum(val_loss1, val_loss2))             
+            val_max = tf.maximum(val_loss1, val_loss2)
+            # print(f'val_max.shape: {val_max.shape}')
+            val_loss = tf.reduce_mean(val_max)             
 
             r = tf.exp(a_logP - a_logP_old) # (b,)            
-            pg_loss = - tf.reduce_mean(tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv))
+            pg_min = tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv)
+            # print(f'pg_min.shape: {pg_min.shape}')
+            pg_loss = - tf.reduce_mean(pg_min)
 
-            ent_loss = - tf.reduce_mean(tf.reduce_sum(ent, axis=-1))
+            ent_sum = tf.reduce_sum(ent, axis=-1)
+            # print(f'ent_sum.shape: {ent_sum.shape}')
+            ent_loss = - tf.reduce_mean(ent_sum)
 
             total_loss = pg_loss + para.w_val * val_loss + para.w_ent * ent_loss
 
@@ -431,6 +437,7 @@ class VecBuf():
         assert adv.shape == self.val[:-1].shape
 
         self.ret = adv + self.val[:-1]
+        # print(f'adv.shape: {adv.shape}')
         self.adv = (adv - adv.mean()) / (adv.std() + 1e-8)  
     
     def get_data(self):
@@ -521,6 +528,8 @@ class Trainer():
 
         for t in range(para.n_iters):
 
+            print(f't: {t}')
+
             buf = VecBuf(para.n_envs)
          
             for _ in range(para.horizon): 
@@ -554,6 +563,8 @@ class Trainer():
             if t % para.log_period == 0:
                 log['cum_reward_mean'], log['cum_reward_std'] = \
                                         self.compute_cum_reward(data.rew, data.don)
+
+                # print(f'len(losses): {len(losses)}')
                 log['loss'] = np.mean(losses)
                 with open("log.txt", "a") as f: f.write(f't: {t}, ' + str(log) + '\n')
 
@@ -582,7 +593,12 @@ class Trainer():
                     cum_reward[j] += rew[i, j]
                     traj_len[j] += 1
 
-        return np.mean(cum_rewards), np.std(cum_rewards)
+
+        if(len(cum_rewards) == 0):
+            return 0, 0
+        else:
+            # print(f'len(cum_rewards): {len(cum_rewards)}')
+            return np.mean(cum_rewards), np.std(cum_rewards)
 
 
 
