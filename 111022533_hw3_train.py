@@ -235,25 +235,54 @@ class Agent(tf.keras.Model):
         
         self.v_head = tf.keras.layers.Dense(units=1, name="v_head")
         
+    # @tf.function
+    # def call(self, x, training=False): # (512, 224, 224, 3)
+    #     x = self.backbone(x)
+    #     x = self.flatten(x)
+    #     return self.a_mean_head(x), self.v_head(x)
+
     @tf.function
-    def call(self, x, training=False): # (512, 224, 224, 3)
+    def call(self, x, training=False):
+        
         x = self.backbone(x)
         x = self.flatten(x)
-        return self.a_mean_head(x), self.v_head(x)
+        a_mean, v = self.a_mean_head(x), self.v_head(x)
+
+        a_mean = a_min + ((a_mean + 1) / 2) * (a_max - a_min)
+
+        dist = tf.compat.v1.distributions.Normal(a_mean, self.a_std, validate_args=True)
+        a = tf.squeeze(dist.sample(1)) # (b, num_actions)        
+        a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,)
+
+        ent = dist.entropy() # (b, n_actions)
+
+        return a, a_logP, ent, tf.squeeze(v, axis=-1)
+
 
 
     def predict(self, state):
         
         state = tf.convert_to_tensor(state, tf.float32)         
-        self.a_mean, self.v = self(state, True) # (b, num_actions), (b, 1)
+        a, a_logP, ent, v = self(state)
+        return a.numpy(), a_logP.numpy(), ent.numpy(), v.numpy()
 
-        self.a_mean = a_min + ((self.a_mean + 1) / 2) * (a_max - a_min)
 
-        self.dist = tf.compat.v1.distributions.Normal(self.a_mean, self.a_std, validate_args=True)
-        self.a = tf.squeeze(self.dist.sample(1)) # (b, num_actions)        
-        self.a_logP = tf.reduce_sum(self.dist.log_prob(self.a), axis=-1) # (b,)
 
-        return self.a.numpy(), self.a_logP.numpy(), tf.squeeze(self.v, axis=-1).numpy()
+
+
+
+    # def predict(self, state):
+        
+    #     state = tf.convert_to_tensor(state, tf.float32)         
+    #     self.a_mean, self.v = self(state, True) # (b, num_actions), (b, 1)
+
+    #     self.a_mean = a_min + ((self.a_mean + 1) / 2) * (a_max - a_min)
+
+    #     self.dist = tf.compat.v1.distributions.Normal(self.a_mean, self.a_std, validate_args=True)
+    #     self.a = tf.squeeze(self.dist.sample(1)) # (b, num_actions)        
+    #     self.a_logP = tf.reduce_sum(self.dist.log_prob(self.a), axis=-1) # (b,)
+
+    #     return self.a.numpy(), self.a_logP.numpy(), tf.squeeze(self.v, axis=-1).numpy()
 
 
 
@@ -312,10 +341,12 @@ class VecBuf():
         self.rew[idx] = rew
         self.don[idx] = don
      
-    def add_advantage(self, advs):
-        self.adv = np.array(advs)
-        assert self.adv.shape == self.val[:-1].shape
-        self.ret = self.adv + self.val[:-1]
+    def add_advantage(self, adv):
+        
+        assert adv.shape == self.val[:-1].shape
+
+        self.ret = adv + self.val[:-1]
+        self.adv = (adv - adv.mean()) / (adv.std() + 1e-8)  
     
     def get_data(self):
     
@@ -331,8 +362,8 @@ class VecBuf():
             })
 
     def flatten(self):
-        self.sta = self.sta.reshape((-1, *para.img_shape, para.k))       # [T x N, 84, 84, 4]
-        self.act = self.act.reshape((-1, num_actions))  # [T x N, 3]        
+        self.sta = self.sta.reshape((-1, *para.img_shape, para.k))  # (H * n_env, 84, 84, 4)
+        self.act = self.act.reshape((-1, num_actions))              # (H * n_env, 3)
         self.alg = self.alg.flatten() 
         self.val = self.val.flatten()  
         self.ret = self.ret.flatten()        
@@ -350,34 +381,33 @@ class VecBuf():
             
             idxes = self.idxes[i * para.batch_size : (i+1) * para.batch_size]
 
-            yield AttrDict({
-                'sta': self.sta[idxes],
-                'act': self.act[idxes],
-                'alg': self.alg[idxes],
-                'val': self.val[idxes],
-                'ret': self.ret[idxes],
-                'adv': self.adv[idxes]
-            })
+            sta = tf.convert_to_tensor(self.sta[idxes], tf.float32) # (b, 84, 84, 4)
+            act = tf.convert_to_tensor(self.act[idxes], tf.float32) # (b, 3)
+            alg = tf.convert_to_tensor(self.alg[idxes], tf.float32) # (b,)
+            val = tf.convert_to_tensor(self.val[idxes], tf.float32) # (b,)
+            ret = tf.convert_to_tensor(self.ret[idxes], tf.float32) # (b,)
+            adv = tf.convert_to_tensor(self.adv[idxes], tf.float32) # (b,)
+            yield sta, act, alg, val, ret, adv
             
       
-def compute_gae(rewards, values, masks, gamma, LAMBDA):
+def compute_gae(rews, vals, masks, gamma, LAMBDA):
+    
+    assert len(rews) == para.horizon
 
-    def _compute_gae(ewards, values, masks):
-        gae = 0
-        adv = []
-        for i in reversed(range(len(rewards))):
-            delta = rewards[i] + gamma * values[i + 1] * masks[i] - values[i]
-            gae = delta + gamma * LAMBDA * masks[i] * gae
-            adv.append(gae)
 
-        adv.reverse()
-        return adv   
+    adv = np.zeros((para.horizon, para.n_envs))
 
-    adv2D = []
-    for i in range(para.n_envs):
-        adv2D.append(_compute_gae(rewards[:,i,...], values[:,i,...], masks[:,i,...]))
+    for j in range(para.n_envs):
 
-    return np.array(adv2D)
+        rew, val, mask = rews[:,i], vals[:,i], masks[:,i]
+
+        gae = 0 
+        for i in reversed(range(para.horizon)):
+            delta = rew[i] + gamma * val[i + 1] * mask[i] - val[i]
+            gae = delta + gamma * LAMBDA * mask[i] * gae            
+            adv[i, j] = gae
+
+    return adv # (horizon, n_envs)
  
 
 
@@ -388,12 +418,11 @@ def compute_gae(rewards, values, masks, gamma, LAMBDA):
 class Trainer():
 
     def __init__(self):
-        pass
+        self.agent = Agent()
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=para.lr)
 
 
-    def train():   
- 
-        model = PPO()
+    def train():    
 
         env = VecEnv([make_env for _ in range(para.n_envs)])
         buf = VecBuf(para.n_envs)
@@ -408,42 +437,19 @@ class Trainer():
          
             for _ in range(horizon): 
                 sta = buf.add_frame(obs) 
-                a, a_logP, value = model.predict(sta) 
+                a, a_logP, value = self.agent.predict(sta) 
                 obs, reward, done, _ = env.step(a)
                 buf.add_value(value)
                 buf.add_effects(a, a_logP, reward, done)
                 
             
             sta = buf.add_frame(obs)
-            buf.add_value(model.predict(sta)[2])
+            buf.add_value(self.agent.predict(sta)[2])
 
             data = buf.get_data()
             advantages = compute_gae(data.rew, data.val, 1-data.don, para.gamma, para.gae_lambda)
             buf.add_advantage(advantages)
-
-
-
-            advantages = compute_gae(rewards, values, dones, discount_factor, gae_lambda)
-
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  
-            returns = advantages + values
-
-            # Flatten arrays
-            states = np.array(states).reshape((-1, *input_shape))       # [T x N, 84, 84, 4]
-            taken_actions = np.array(taken_actions).reshape((-1, num_actions))  # [T x N, 3]            
-            returns = returns.flatten() # [T x N]
-            advantages = advantages.flatten() # [T x N]
-
-            # T = len(rewards)
-            # N = num_envs
-            # assert states.shape == (T * N, input_shape[0], input_shape[1], frame_stack_size)
-            # assert taken_actions.shape == (T * N, num_actions)
-            # assert returns.shape == (T * N,)
-            # assert advantages.shape == (T * N,)
-
-            # Train for some number of epochs
-            # model.update_old_policy()  # θ_old <- θ
-
+ 
 
             buf.flatten()
 
@@ -456,7 +462,7 @@ class Trainer():
                 
                 for batch in buf.batch(): 
 
-                    self.train_step(batch)
+                    loss = self.train_step(batch)
                 
 
                     # model.train(states[mb_idx], taken_actions[mb_idx],
@@ -475,9 +481,37 @@ class Trainer():
                     # if model.step_idx % save_interval == 0:
                     #     model.save()
 
+    @tf.function
     def train_step(self, batch):
+        
+        sta, a, a_logP_old, val_old, ret, adv = batch
+
+        with tf.GradientTape() as tape:
 
 
+            # sta = tf.convert_to_tensor(self.sta[idxes], tf.float32) # (b, 84, 84, 4)
+            # act = tf.convert_to_tensor(self.act[idxes], tf.float32) # (b, 3)
+            # alg = tf.convert_to_tensor(self.alg[idxes], tf.float32) # (b,)
+            # val = tf.convert_to_tensor(self.val[idxes], tf.float32) # (b,)
+            # ret = tf.convert_to_tensor(self.ret[idxes], tf.float32) # (b,)
+            # adv = tf.convert_to_tensor(self.adv[idxes], tf.float32) # (b,)
+
+            a, a_logP, ent, val = self.agent(sta) 
+
+            val_loss = tf.reduce_mean(tf.square(val - val_old))             
+
+            r = tf.exp(a_logP - a_logP_old) # (b,)
+            eps = para.ppo_clip
+            pg_loss = - tf.reduce_mean(tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv))
+
+            ent_loss = tf.reduce_mean(tf.reduce_sum(ent, axis=-1))
+
+            total_loss = pg_loss + para.w_val * val_loss + para.w_ent * ent_loss
+
+        gradients = tape.gradient(total_loss, self.agent.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.agent.trainable_variables))
+    
+        return total_loss
 
 
     def evaluate(self):
