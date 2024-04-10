@@ -57,11 +57,13 @@ para = AttrDict({
     'w_ent': 0.01,
     'horizon': 128,
     'epochs': 10,
+    'n_iters': int(1e7),
     'batch_size': 128,
     'n_envs': 8,
 
     'save_period': 1000,
     'eval_period': 200,
+    'log_period': 200,
 
     'ckpt_save_path': "ckpt/checkpoint0.h5",
     # 'ckpt_load_path': "ckpt/checkpoint1.h5"
@@ -223,6 +225,8 @@ class Backbone(tf.keras.layers.Layer):
 
 
 
+
+
 class Agent(tf.keras.Model):
 
     def __init__(self):  
@@ -234,13 +238,10 @@ class Agent(tf.keras.Model):
                       initializer = tf.keras.initializers.Constant(value=0.5), dtype=tf.float32)
         
         self.v_head = tf.keras.layers.Dense(units=1, name="v_head")
+        self.update_counts = 0
         
-    # @tf.function
-    # def call(self, x, training=False): # (512, 224, 224, 3)
-    #     x = self.backbone(x)
-    #     x = self.flatten(x)
-    #     return self.a_mean_head(x), self.v_head(x)
-
+   
+   
     @tf.function
     def call(self, x, training=False):
         
@@ -251,54 +252,91 @@ class Agent(tf.keras.Model):
         a_mean = a_min + ((a_mean + 1) / 2) * (a_max - a_min)
 
         dist = tf.compat.v1.distributions.Normal(a_mean, self.a_std, validate_args=True)
-        a = tf.squeeze(dist.sample(1)) # (b, num_actions)        
-        a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,)
-
-        ent = dist.entropy() # (b, n_actions)
-
-        return a, a_logP, ent, tf.squeeze(v, axis=-1)
 
 
+        return dist, tf.squeeze(v, axis=-1)
+
+     
 
     def predict(self, state):
         
         state = tf.convert_to_tensor(state, tf.float32)         
-        a, a_logP, ent, v = self(state)
-        return a.numpy(), a_logP.numpy(), ent.numpy(), v.numpy()
+        # a, a_logP, ent, v = self(state)
+        dist, v = self(state)
 
+        a = tf.squeeze(dist.sample(1)) # (b, num_actions)        
+        a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,) 
+               
 
-
-
-
-
-    # def predict(self, state):
-        
-    #     state = tf.convert_to_tensor(state, tf.float32)         
-    #     self.a_mean, self.v = self(state, True) # (b, num_actions), (b, 1)
-
-    #     self.a_mean = a_min + ((self.a_mean + 1) / 2) * (a_max - a_min)
-
-    #     self.dist = tf.compat.v1.distributions.Normal(self.a_mean, self.a_std, validate_args=True)
-    #     self.a = tf.squeeze(self.dist.sample(1)) # (b, num_actions)        
-    #     self.a_logP = tf.reduce_sum(self.dist.log_prob(self.a), axis=-1) # (b,)
-
-    #     return self.a.numpy(), self.a_logP.numpy(), tf.squeeze(self.v, axis=-1).numpy()
-
-
-
-
-
+        return a.numpy(), a_logP.numpy(), v.numpy()
  
+
+
+    def train_step(self, batch):
+        self.update_counts += 1
+        loss = self._train_step(batch)
+        return loss.numpy()
+
+    @tf.function
+    def _train_step(self, batch):
+        
+        sta, a, a_logP_old, val_old, ret, adv = batch
+
+        with tf.GradientTape() as tape:
+
+            # sta = tf.convert_to_tensor(self.sta[idxes], tf.float32) # (b, 84, 84, 4)
+            # act = tf.convert_to_tensor(self.act[idxes], tf.float32) # (b, 3)
+            # alg = tf.convert_to_tensor(self.alg[idxes], tf.float32) # (b,)
+            # val = tf.convert_to_tensor(self.val[idxes], tf.float32) # (b,)
+            # ret = tf.convert_to_tensor(self.ret[idxes], tf.float32) # (b,)
+            # adv = tf.convert_to_tensor(self.adv[idxes], tf.float32) # (b,)
+
+            eps = para.ppo_clip
+ 
+            dist, val = self(sta, True)
+            a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,) 
+            ent = dist.entropy()       
+
+            val_clip = val + tf.clip_by_value(val - val_old, 1-eps, 1+eps)
+            val_loss1 = tf.square(ret - val) # (b,)
+            val_loss2 = tf.square(ret - val_clip) # (b,)
+            val_loss = tf.reduce_mean(tf.maximum(val_loss1, val_loss2))             
+
+            r = tf.exp(a_logP - a_logP_old) # (b,)            
+            pg_loss = - tf.reduce_mean(tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv))
+
+            ent_loss = - tf.reduce_mean(tf.reduce_sum(ent, axis=-1))
+
+            total_loss = pg_loss + para.w_val * val_loss + para.w_ent * ent_loss
+
+        gradients = tape.gradient(total_loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+    
+        return total_loss
+
+
+    def save_checkpoint(self, path):  
+        print(f'- saved ckpt {path}') 
+        self.save_weights(path)
+         
+
+    def load_checkpoint(self, path):         
+        print(f'- loaded ckpt {path}') 
+        self(tf.random.uniform(shape=[1, *para.img_shape, para.k]))
+        self.load_weights(path)
+
+
+
+
+
+
 def preprocess_frame(img):     
     img = img[:-12, 6:-6] # (84, 84, 3)
     img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140])
     img = img / 255.0
     img = img * 2 - 1     
     assert img.shape == (84, 84)
-    return img
-
-
-
+    return im 
 
 class VecBuf():
 
@@ -418,22 +456,26 @@ def compute_gae(rews, vals, masks, gamma, LAMBDA):
 class Trainer():
 
     def __init__(self):
+
         self.agent = Agent()
+        if('ckpt_load_path' in para): 
+            self.agent.load_checkpoint(para.ckpt_load_path)
+
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=para.lr)
 
 
     def train():    
 
         env = VecEnv([make_env for _ in range(para.n_envs)])
-        buf = VecBuf(para.n_envs)
-
-        obs = envs.reset()
-        # envs.get_images()
-
-        buf.add_frame(obs)
+        obs = env.reset()
+    
  
-         
-        while True:
+        with open("log.txt", "w") as f: f.write("")
+        log = {}
+
+        for t in range(para.n_iters):
+
+            buf = VecBuf(para.n_envs)
          
             for _ in range(horizon): 
                 sta = buf.add_frame(obs) 
@@ -441,121 +483,62 @@ class Trainer():
                 obs, reward, done, _ = env.step(a)
                 buf.add_value(value)
                 buf.add_effects(a, a_logP, reward, done)
-                
             
+                        
             sta = buf.add_frame(obs)
             buf.add_value(self.agent.predict(sta)[2])
 
             data = buf.get_data()
             advantages = compute_gae(data.rew, data.val, 1-data.don, para.gamma, para.gae_lambda)
             buf.add_advantage(advantages)
- 
+            
 
             buf.flatten()
 
             for _ in range(num_epochs):
-                # num_samples = len(states)
-                # indices = np.arange(num_samples)
-                # np.random.shuffle(indices)
-                
                 buf.shuffle() 
                 
                 for batch in buf.batch(): 
 
-                    loss = self.train_step(batch)
-                
+                    loss = self.agent.train_step(batch)
+                                    
+                    if self.agent.update_counts % para.save_period == 0:
+                        # self.agent.save_checkpoint(para.ckpt_save_path)
+                        self.agent.save_checkpoint(f"ckpt/checkpoint{t}.h5")
+                        
+                    
+                    if self.agent.update_counts % para.log_period == 0:
+                        log['cum_reward_mean'], log['cum_reward_std'] = \
+                                                self.compute_cum_reward(data.rew, data.don)
+                        log['loss'] = loss
+                        with open("log.txt", "a") as f: f.write(f't: {t}, ' + str(log) + '\n')
 
-                    # model.train(states[mb_idx], taken_actions[mb_idx],
-                    #             returns[mb_idx], advantages[mb_idx])
-
-                    # # Evaluate model
-                    # if model.step_idx % eval_interval == 0:
-                    #     print("[INFO] Running evaluation...")
-
-                    #     avg_reward, value_error = self.evaluate()
-
-                    #     model.write_to_summary("eval_avg_reward", avg_reward)
-                    #     model.write_to_summary("eval_value_error", value_error)
-
-                    # # Save model
-                    # if model.step_idx % save_interval == 0:
-                    #     model.save()
-
-    @tf.function
-    def train_step(self, batch):
         
-        sta, a, a_logP_old, val_old, ret, adv = batch
 
-        with tf.GradientTape() as tape:
+    def compute_cum_reward(self, rew, don): 
 
+        cum_rewards = []
+        traj_lens = []
 
-            # sta = tf.convert_to_tensor(self.sta[idxes], tf.float32) # (b, 84, 84, 4)
-            # act = tf.convert_to_tensor(self.act[idxes], tf.float32) # (b, 3)
-            # alg = tf.convert_to_tensor(self.alg[idxes], tf.float32) # (b,)
-            # val = tf.convert_to_tensor(self.val[idxes], tf.float32) # (b,)
-            # ret = tf.convert_to_tensor(self.ret[idxes], tf.float32) # (b,)
-            # adv = tf.convert_to_tensor(self.adv[idxes], tf.float32) # (b,)
-
-            a, a_logP, ent, val = self.agent(sta) 
-
-            val_loss = tf.reduce_mean(tf.square(val - val_old))             
-
-            r = tf.exp(a_logP - a_logP_old) # (b,)
-            eps = para.ppo_clip
-            pg_loss = - tf.reduce_mean(tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv))
-
-            ent_loss = tf.reduce_mean(tf.reduce_sum(ent, axis=-1))
-
-            total_loss = pg_loss + para.w_val * val_loss + para.w_ent * ent_loss
-
-        gradients = tape.gradient(total_loss, self.agent.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.agent.trainable_variables))
-    
-        return total_loss
-
-
-    def evaluate(self):
-
-
-        total_reward = 0
-
-        test_env = gym.make(env_name)
-        # test_env.seed(0)
+        cum_reward = [0] * para.n_envs
+        traj_len = [0] * para.n_envs
         
-        initial_frame = test_env.reset()
-        
-        frame_stack = FrameStack(
-            initial_frame, stack_size=frame_stack_size,
-            preprocess_fn=preprocess_frame)
+		for i in range(para.horizon):
+			for j in range(para.n_envs):
 
-        rendered_frame = test_env.render(mode="rgb_array")
-        values, rewards, dones = [], [], []
-        if make_video:
-            video_writer = cv2.VideoWriter(os.path.join(model.video_dir, "step{}.avi".format(model.step_idx)),
-                                        cv2.VideoWriter_fourcc(*"MPEG"), 30,
-                                        (rendered_frame.shape[1], rendered_frame.shape[0]))
-        while True:
-            # Predict action given state: π(a_t | s_t; θ)
-            state = frame_stack.get_state()
-            action, value = model.predict(
-                np.expand_dims(state, axis=0), greedy=False)
-            frame, reward, done, _ = test_env.step(action[0])
-            rendered_frame = test_env.render(mode="rgb_array")
-            total_reward += reward
-            dones.append(done)
-            values.append(value)
-            rewards.append(reward)
-            frame_stack.add_frame(frame)
-            if make_video:
-                video_writer.write(cv2.cvtColor(rendered_frame, cv2.COLOR_RGB2BGR))
-            if done:
-                break
-        if make_video:
-            video_writer.release()
-        returns = compute_returns(np.transpose([rewards], [1, 0]), [
-                                0], np.transpose([dones], [1, 0]), discount_factor)
-        value_error = np.mean(np.square(np.array(values) - returns))
-        return total_reward, value_error
+				if don[i, j]:
+
+					cum_rewards.append(cum_reward[j] + rew[i, j])
+					traj_lens.append(traj_len[j] + 1)
+
+					cum_reward[j] = 0
+					traj_len[j] = 0
+
+				else:
+					cum_reward[j] += rew[i, j]
+					traj_len[j] += 1
+
+        return np.mean(cum_rewards), np.std(cum_rewards)
 
 
 
