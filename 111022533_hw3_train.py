@@ -2,6 +2,11 @@ import gym
 import gym_multi_car_racing 
 import numpy as np
 from multiprocessing import Process, Pipe
+from collections import deque
+
+import tensorflow.keras.backend as K
+import tensorflow as tf
+import importlib
 
  
 # env = gym.make("MultiCarRacing-v0", num_agents=1, direction='CCW',
@@ -41,7 +46,7 @@ para = AttrDict({
     
     'k': 4,
     'skip': 4,
-    'frame_shape': (84, 84, 1),
+    'img_shape': (84, 84),
 
 
     'lr': 1e-4,
@@ -52,8 +57,8 @@ para = AttrDict({
     'w_ent': 0.01,
     'horizon': 128,
     'epochs': 10,
-    'bact_size': 128,
-    'envs': 8,
+    'batch_size': 128,
+    'n_envs': 8,
 
     'save_period': 1000,
     'eval_period': 200,
@@ -196,8 +201,8 @@ def preprocess_frame(img):
     img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140])
     # img = img / 255.0
     # img = img * 2 - 1    
-    img = img[..., np.newaxis] # (84, 84, 1)
-    assert img.shape == (84, 84, 1)
+    # img = img[..., np.newaxis] # (84, 84, 1)
+    assert img.shape == (84, 84)
     return img
 
 
@@ -207,91 +212,93 @@ class VecBuf():
 
     def __init__(self, n_envs):        
 
-        self.trainer = trainer
-
-        self.n = 0
+       
         self.n_envs = n_envs
-        
-        steps = para.horizon + para.k - 1    
-
-        self.obs = np.zeros((steps, n_envs, *para.frame_shape), dtype=np.uint8)
-        self.action = np.zeros((steps, n_envs, num_actions))
-        self.value = np.zeros((steps, n_envs))        
-        self.reward = np.zeros((steps, n_envs))
-        self.done = np.zeros((steps, n_envs))
+        self.n = 0
+         
+        self.stack = [deque(maxlen=para.k) for _ in range(para.n_envs)]
+        self.add_frame([np.zeros((*para.img_shape, 3)) for _ in n_envs])
+         
+        self.sta = np.zeros((para.horizon+1, n_envs, *para.img_shape, para.k), dtype=np.uint8)
+        self.val = np.zeros((para.horizon+1, n_envs)) 
+        self.act = np.zeros((para.horizon, n_envs, num_actions))               
+        self.rew = np.zeros((para.horizon, n_envs))
+        self.don = np.zeros((para.horizon, n_envs), dtype='bool')
+        self.adv = None
+        self.ret = None
 
     
 
     def add_frame(self, frames):
         
-        for i, frame in enumerate(frames):
-            self.obs[self.n, i] = preprocess_frame(frame)
+        for i in range(self.n_envs):
+            self.stack[i].append(preprocess_frame(frames[i]))
+            self.sta[self.n, i] = np.stack(self.stack[i], axis=-1)
+        self.n+=1
+        return [sta for sta in self.sta[self.n, :]]
+ 
+    def add_value(self, val):
+        self.val[self.n-1] = np.array(val)
 
-        self.n +=  1
-        return i 
-
-    def get_state(self, step):
-        return 
-
-    def _get_state(self, step, envId):    
-
-        d = para.k - 1  
-        idx = d + step
-        
-        _start = idx-d
-        end = idx+1 # non-inclusive
-        start = _start
-        for i in range(_start, end-1):
-            if self.done[i, envId] > 0.5: start = i+1
-    
-        n = para.k - (end - start)
-
-        out = np.concatenate([np.zeros(para.frame_shape)[np.newaxis,...]]*n  +\
-                         [obs[np.newaxis,...] for obs in self.obs[start:end, envId]], axis=3) / 255.0
-
-        assert out.shape == (1, para.frame_shape[0], para.frame_shape[1], para.k)
-        return out
-
-        
-    def add_effects(self, idx, action, reward, done):
-        self.action[idx] = action
-        self.reward[idx] = reward
-        self.done[idx] = int(done)
+    def add_effects(self, act, rew, don):
+        idx = self.n-1
+        self.act[idx] = np.array(act)
+        self.rew[idx] = np.array(rew)
+        self.don[idx] = np.array(don)
      
-  
+    def add_advantage(self, advs):
+        self.adv = np.array(advs)
+        assert self.adv.shape == self.val[:-1].shape
+        self.ret = self.adv + self.val[:-1]
+    
+    def get_data(self):
+    
+        return AttrDict({
+                'obs': self.sta,
+                'act': self.act,
+                'val': self.val,
+                'rew': self.rew,
+                'don': self.don.astype(np.int32),
+                'adv': self.adv,
+                'ret': self.ret
+            })
 
-    def sample(self, size):     
+    def flatten(self):
+        self.sta = self.sta.reshape((-1, *para.img_shape, para.k))       # [T x N, 84, 84, 4]
+        self.act = self.act.reshape((-1, num_actions))  # [T x N, 3]        
+        self.ret = self.ret.flatten()        
+        self.adv = self.adv.flatten()
 
-        assert self.n >= size
- 
-        idxes = np.random.choice(np.arange(para.k-1, self.n-1), size=size, replace=False)   
- 
-        return self.retrive_data(idxes)
+    def shuffle(self):
+        self.idxes = np.arange(para.horizon)
+        np.random.shuffle(self.idxes)
 
+    def batch(self):
 
+        n = int(np.ceil(para.horizon / para.batch_size))
+    
+        for i in range(n):
+            
+            idxes = self.idxes[i * para.batch_size : (i+1) * para.batch_size]
 
-    def retrive_data(self, idxes):
-        # print(f'idxes: {idxes}')
-        state = np.concatenate([self.stack_frame(idx) for idx in idxes], axis=0) 
-        action = np.array([self.action[idx] for idx in idxes])
-        reward = np.array([self.reward[idx] for idx in idxes])
-        state_next = np.concatenate([self.stack_frame(idx+1) for idx in idxes], axis=0) 
-        done = np.array([self.done[idx] for idx in idxes])
-        
-        # print(f'max(state): {np.max(state)}, state: {state}')
+            yield AttrDict({
+                'obs': self.sta[idxes],
+                'act': self.act[idxes],
+                'val': self.ret[idxes],
+                'adv': self.adv[idxes]
+            })
+            
+      
+def compute_gae(rewards, values, masks, gamma, LAMBDA):
+    gae = 0
+    advantages = []
+    for i in reversed(range(len(rewards))):
+        delta = rewards[i] + gamma * values[i + 1] * masks[i] - values[i]
+        gae = delta + gamma * LAMBDA * masks[i] * gae
+        advantages.append(gae)
 
-        state = tf.convert_to_tensor(state, tf.float32) 
-        action = tf.convert_to_tensor(action, tf.int32)
-        reward = tf.convert_to_tensor(reward, tf.float32)
-        state_next = tf.convert_to_tensor(state_next, tf.float32)   
-        done = tf.convert_to_tensor(done, tf.float32)
-
-        return state, action, reward, state_next, done
-
-
-
-
-
+    advantages.reverse()
+    return advantages    
 
 
 class Trainer():
@@ -304,8 +311,8 @@ class Trainer():
  
         model = PPO()
 
-        env = VecEnv([make_env for _ in range(para.envs)])
-        buf = VecBuf(para.envs)
+        env = VecEnv([make_env for _ in range(para.n_envs)])
+        buf = VecBuf(para.n_envs)
 
         obs = envs.reset()
         # envs.get_images()
@@ -315,101 +322,84 @@ class Trainer():
         # frame_stacks = [FrameStack(initial_frames[i], stack_size=frame_stack_size,
         #                         preprocess_fn=preprocess_frame) for i in range(num_envs)]
 
+
+
          
         while True:
-            # While there are running environments
-            states, taken_actions, values, rewards, dones = [], [], [], [], []
+         
+            for _ in range(horizon): 
+                sta = buf.add_frame(obs) 
+                action, value = model.predict(sta) 
+                obs, reward, done, _ = env.step(action)
+                buf.add_value(value)
+                buf.add_effects(action, reward, done)
+                
+            
+            sta = buf.add_frame(obs)
+            buf.add_value(model.predict(sta)[1])
 
-            # Simulate game for some number of steps
-            for _ in range(horizon):
-                # Predict and value action given state
-                # π(a_t | s_t; θ_old)
-                states_t = [frame_stacks[i].get_state() for i in range(num_envs)]
-                actions_t, values_t = model.predict(states_t)
+            data = buf.get_data()
+            advantages = compute_gae(data.rew, data.val, 1-data.don, para.gamma, para.gae_lambda)
+            buf.add_advantage(advantages)
 
-                # Sample action from a Gaussian distribution
-                envs.step_async(actions_t)
-                frames, rewards_t, dones_t, _ = envs.step_wait()
-                envs.get_images()  # render
 
-                # Store state, action and reward
-                # [T, N, 84, 84, 4]
-                states.append(states_t)
-                taken_actions.append(actions_t)              # [T, N, 3]
-                values.append(np.squeeze(values_t, axis=-1))  # [T, N]
-                rewards.append(rewards_t)                    # [T, N]
-                dones.append(dones_t)                        # [T, N]
 
-                # Get new state
-                for i in range(num_envs):
-                    # Reset environment's frame stack if done
-                    if dones_t[i]:
-                        for _ in range(frame_stack_size):
-                            frame_stacks[i].add_frame(frames[i])
-                    else:
-                        frame_stacks[i].add_frame(frames[i])
+            advantages = compute_gae(rewards, values, dones, discount_factor, gae_lambda)
 
-            # Calculate last values (bootstrap values)
-            states_last = [frame_stacks[i].get_state()
-                        for i in range(num_envs)]
-            last_values = np.squeeze(model.predict(
-                states_last)[1], axis=-1)  # [N]
-
-            advantages = compute_gae(
-                rewards, values, last_values, dones, discount_factor, gae_lambda)
-            advantages = (advantages - advantages.mean()) / \
-                (advantages.std() + 1e-8)  # Move down one line?
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  
             returns = advantages + values
-            # Flatten arrays
-            states = np.array(states).reshape(
-                (-1, *input_shape))       # [T x N, 84, 84, 4]
-            taken_actions = np.array(taken_actions).reshape(
-                (-1, num_actions))  # [T x N, 3]
-            # [T x N]
-            returns = returns.flatten()
-            # [T X N]
-            advantages = advantages.flatten()
 
-            T = len(rewards)
-            N = num_envs
-            assert states.shape == (
-                T * N, input_shape[0], input_shape[1], frame_stack_size)
-            assert taken_actions.shape == (T * N, num_actions)
-            assert returns.shape == (T * N,)
-            assert advantages.shape == (T * N,)
+            # Flatten arrays
+            states = np.array(states).reshape((-1, *input_shape))       # [T x N, 84, 84, 4]
+            taken_actions = np.array(taken_actions).reshape((-1, num_actions))  # [T x N, 3]            
+            returns = returns.flatten() # [T x N]
+            advantages = advantages.flatten() # [T x N]
+
+            # T = len(rewards)
+            # N = num_envs
+            # assert states.shape == (T * N, input_shape[0], input_shape[1], frame_stack_size)
+            # assert taken_actions.shape == (T * N, num_actions)
+            # assert returns.shape == (T * N,)
+            # assert advantages.shape == (T * N,)
 
             # Train for some number of epochs
             model.update_old_policy()  # θ_old <- θ
+
+
+            buf.flatten()
+
             for _ in range(num_epochs):
-                num_samples = len(states)
-                indices = np.arange(num_samples)
-                np.random.shuffle(indices)
-                for i in range(int(np.ceil(num_samples / batch_size))):
-                    # Evaluate model
-                    if model.step_idx % eval_interval == 0:
-                        print("[INFO] Running evaluation...")
+                # num_samples = len(states)
+                # indices = np.arange(num_samples)
+                # np.random.shuffle(indices)
+                
+                buf.shuffle() 
+                
+                for batch in buf.batch(): 
 
-                        avg_reward, value_error = self.evaluate()
+                    self.train_step(batch)
+                
 
-                        model.write_to_summary("eval_avg_reward", avg_reward)
-                        model.write_to_summary("eval_value_error", value_error)
+                    # model.train(states[mb_idx], taken_actions[mb_idx],
+                    #             returns[mb_idx], advantages[mb_idx])
 
-                    # Save model
-                    if model.step_idx % save_interval == 0:
-                        model.save()
+                    # # Evaluate model
+                    # if model.step_idx % eval_interval == 0:
+                    #     print("[INFO] Running evaluation...")
 
-                    # Sample mini-batch randomly
-                    begin = i * batch_size
-                    end = begin + batch_size
-                    if end > num_samples:
-                        end = None
-                    mb_idx = indices[begin:end]
+                    #     avg_reward, value_error = self.evaluate()
 
-                    # Optimize network
-                    model.train(states[mb_idx], taken_actions[mb_idx],
-                                returns[mb_idx], advantages[mb_idx])
+                    #     model.write_to_summary("eval_avg_reward", avg_reward)
+                    #     model.write_to_summary("eval_value_error", value_error)
+
+                    # # Save model
+                    # if model.step_idx % save_interval == 0:
+                    #     model.save()
+
+    def train_step(self, batch):
 
 
+        
 
     def evaluate(self):
 
