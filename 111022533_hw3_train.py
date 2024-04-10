@@ -68,7 +68,7 @@ para = AttrDict({
     'n_envs': 8,
 
     'save_period': 100,    
-    'log_period': 10,
+    'log_period': 5,
 
     'ckpt_save_path': "ckpt/checkpoint0.h5",
     # 'ckpt_load_path': "ckpt/checkpoint1.h5"
@@ -572,33 +572,38 @@ class Trainer():
 
     def compute_cum_reward(self, rew, don): 
 
-        cum_rewards = []
-        traj_lens = []
+        # cum_rewards = []
+        # traj_lens = []
 
-        cum_reward = [0] * para.n_envs
-        traj_len = [0] * para.n_envs
+        # cum_reward = [0] * para.n_envs
+        # traj_len = [0] * para.n_envs
         
-        for i in range(para.horizon):
-            for j in range(para.n_envs):
+        # print(f'don: {don}')
 
-                if don[i, j]:
+        cum_rewards = [np.sum(rew[j]) for j in range(para.n_envs)]
+        return np.mean(cum_rewards), np.std(cum_rewards)
 
-                    cum_rewards.append(cum_reward[j] + rew[i, j])
-                    traj_lens.append(traj_len[j] + 1)
+        # for i in range(para.horizon):
+        #     for j in range(para.n_envs):
 
-                    cum_reward[j] = 0
-                    traj_len[j] = 0
+        #         if don[i, j]:
 
-                else:
-                    cum_reward[j] += rew[i, j]
-                    traj_len[j] += 1
+        #             cum_rewards.append(cum_reward[j] + rew[i, j])
+        #             traj_lens.append(traj_len[j] + 1)
+
+        #             cum_reward[j] = 0
+        #             traj_len[j] = 0
+
+        #         else:
+        #             cum_reward[j] += rew[i, j]
+        #             traj_len[j] += 1
 
 
-        if(len(cum_rewards) == 0):
-            return 0, 0
-        else:
-            # print(f'len(cum_rewards): {len(cum_rewards)}')
-            return np.mean(cum_rewards), np.std(cum_rewards)
+        # if(len(cum_rewards) == 0):
+        #     return 0, 0
+        # else:
+        #     # print(f'len(cum_rewards): {len(cum_rewards)}')
+        #     return np.mean(cum_rewards), np.std(cum_rewards)
 
 
 
