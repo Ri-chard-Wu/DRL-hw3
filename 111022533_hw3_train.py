@@ -18,13 +18,13 @@ import importlib
 # total_reward = 0
  
 # num_actions = env.action_space.shape[0]
-# action_min = env.action_space.low
-# action_max = env.action_space.high
+# a_min = env.action_space.low
+# a_max = env.action_space.high
 
-# print(f'num_actions: {num_actions}, action_min: {action_min}, action_max: {action_max}')
+# print(f'num_actions: {num_actions}, a_min: {a_min}, a_max: {a_max}')
 
 # while not done: 
-#   action = [0, 1, 0] 
+#   action = np.array([0, 1, 0] )
 #   obs, reward, done, info = env.step(action)
 #   total_reward += reward
 # print("individual scores:", total_reward)
@@ -34,8 +34,8 @@ import importlib
 
 
 num_actions = 3
-action_min = [-1.0,  0.0,  0.0]
-action_max = [1.0, 1.0, 1.0]
+a_min = np.array([-1.0,  0.0,  0.0])
+a_max = np.array([1.0, 1.0, 1.0])
 
  
 
@@ -168,9 +168,13 @@ class VecEnv():
             remote.close()
 
         
-    def step(self, actions):
-        for remote, action in zip(self.remotes, actions):
-            remote.send(('step', action))
+    def step(self, actions): # actions: (n_env, n_actions) numpy array.
+
+        # for remote, action in zip(self.remotes, actions):
+        #     remote.send(('step', action))
+
+        for i in range(len(self.remote)):
+            self.remotes.send(('step', actions[i]))
         
         results = [remote.recv() for remote in self.remotes]
         obs, rews, dones, infos = zip(*results)
@@ -195,13 +199,72 @@ class VecEnv():
 
 
 
+
+
+class Backbone(tf.keras.layers.Layer):
+
+    def __init__(self):
+        super(Backbone, self).__init__(name='backbone')
+
+    def build(self, input_shape):
+
+        self.seq = []
+        self.seq.append(tf.keras.layers.Conv2D(filters=32, kernel_size=8, strides=4))
+        self.seq.append(tf.keras.layers.ReLU())
+        self.seq.append(tf.keras.layers.Conv2D(filters=64, kernel_size=4, strides=2))
+        self.seq.append(tf.keras.layers.ReLU())
+        self.seq.append(tf.keras.layers.Conv2D(filters=64, kernel_size=2, strides=1))
+        self.seq.append(tf.keras.layers.ReLU())
+  
+       
+    def call(self, x, training=False): # x.shape: (64, 65, 64) = (64, 65, hidden_size)
+        for layer in self.seq: x = layer(x, training=training)
+        return x
+
+
+
+class Agent(tf.keras.Model):
+
+    def __init__(self):  
+
+        self.backbone = Backbone()
+        self.flatten = tf.keras.layers.Flatten()
+        self.a_mean_head = tf.keras.layers.Dense(units=num_actions, activation='tanh', name="a_mean_head")
+        self.a_std = self.add_weight("a_std", shape=[num_actions,], trainable=False
+                      initializer = tf.keras.initializers.Constant(value=0.5), dtype=tf.float32)
+        
+        self.v_head = tf.keras.layers.Dense(units=1, name="v_head")
+        
+    @tf.function
+    def call(self, x, training=False): # (512, 224, 224, 3)
+        x = self.backbone(x)
+        x = self.flatten(x)
+        return self.a_mean_head(x), self.v_head(x)
+
+
+    def predict(self, state):
+        
+        state = tf.convert_to_tensor(state, tf.float32)         
+        self.a_mean, self.v = self(state, True) # (b, num_actions), (b, 1)
+
+        self.a_mean = a_min + ((self.a_mean + 1) / 2) * (a_max - a_min)
+
+        self.dist = tf.compat.v1.distributions.Normal(self.a_mean, self.a_std, validate_args=True)
+        self.a = tf.squeeze(self.dist.sample(1)) # (b, num_actions)        
+        self.a_logP = tf.reduce_sum(self.dist.log_prob(self.a), axis=-1) # (b,)
+
+        return self.a.numpy(), self.a_logP.numpy(), tf.squeeze(self.v, axis=-1).numpy()
+
+
+
+
+
  
 def preprocess_frame(img):     
     img = img[:-12, 6:-6] # (84, 84, 3)
     img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140])
-    # img = img / 255.0
-    # img = img * 2 - 1    
-    # img = img[..., np.newaxis] # (84, 84, 1)
+    img = img / 255.0
+    img = img * 2 - 1     
     assert img.shape == (84, 84)
     return img
 
@@ -219,9 +282,10 @@ class VecBuf():
         self.stack = [deque(maxlen=para.k) for _ in range(para.n_envs)]
         self.add_frame([np.zeros((*para.img_shape, 3)) for _ in n_envs])
          
-        self.sta = np.zeros((para.horizon+1, n_envs, *para.img_shape, para.k), dtype=np.uint8)
+        self.sta = np.zeros((para.horizon+1, n_envs, *para.img_shape, para.k))
         self.val = np.zeros((para.horizon+1, n_envs)) 
         self.act = np.zeros((para.horizon, n_envs, num_actions))               
+        self.alg = np.zeros((para.horizon, n_envs))               
         self.rew = np.zeros((para.horizon, n_envs))
         self.don = np.zeros((para.horizon, n_envs), dtype='bool')
         self.adv = None
@@ -235,16 +299,18 @@ class VecBuf():
             self.stack[i].append(preprocess_frame(frames[i]))
             self.sta[self.n, i] = np.stack(self.stack[i], axis=-1)
         self.n+=1
-        return [sta for sta in self.sta[self.n, :]]
+        # return [sta for sta in self.sta[self.n, :]]
+        return self.sta[self.n, :] # (n_env, 84, 84, 4)
  
     def add_value(self, val):
-        self.val[self.n-1] = np.array(val)
+        self.val[self.n-1] = val # (n_env,)
 
-    def add_effects(self, act, rew, don):
+    def add_effects(self, act, alg, rew, don):
         idx = self.n-1
-        self.act[idx] = np.array(act)
-        self.rew[idx] = np.array(rew)
-        self.don[idx] = np.array(don)
+        self.act[idx] = act
+        self.alg[idx] = alg
+        self.rew[idx] = rew
+        self.don[idx] = don
      
     def add_advantage(self, advs):
         self.adv = np.array(advs)
@@ -254,8 +320,9 @@ class VecBuf():
     def get_data(self):
     
         return AttrDict({
-                'obs': self.sta,
+                'sta': self.sta,
                 'act': self.act,
+                'alg': self.alg,
                 'val': self.val,
                 'rew': self.rew,
                 'don': self.don.astype(np.int32),
@@ -266,39 +333,56 @@ class VecBuf():
     def flatten(self):
         self.sta = self.sta.reshape((-1, *para.img_shape, para.k))       # [T x N, 84, 84, 4]
         self.act = self.act.reshape((-1, num_actions))  # [T x N, 3]        
+        self.alg = self.alg.flatten() 
+        self.val = self.val.flatten()  
         self.ret = self.ret.flatten()        
         self.adv = self.adv.flatten()
 
     def shuffle(self):
-        self.idxes = np.arange(para.horizon)
+        self.idxes = np.arange(para.horizon * self.n_envs)
         np.random.shuffle(self.idxes)
 
     def batch(self):
 
-        n = int(np.ceil(para.horizon / para.batch_size))
+        n = int(np.ceil(para.horizon * self.n_envs / para.batch_size))
     
         for i in range(n):
             
             idxes = self.idxes[i * para.batch_size : (i+1) * para.batch_size]
 
             yield AttrDict({
-                'obs': self.sta[idxes],
+                'sta': self.sta[idxes],
                 'act': self.act[idxes],
-                'val': self.ret[idxes],
+                'alg': self.alg[idxes],
+                'val': self.val[idxes],
+                'ret': self.ret[idxes],
                 'adv': self.adv[idxes]
             })
             
       
 def compute_gae(rewards, values, masks, gamma, LAMBDA):
-    gae = 0
-    advantages = []
-    for i in reversed(range(len(rewards))):
-        delta = rewards[i] + gamma * values[i + 1] * masks[i] - values[i]
-        gae = delta + gamma * LAMBDA * masks[i] * gae
-        advantages.append(gae)
 
-    advantages.reverse()
-    return advantages    
+    def _compute_gae(ewards, values, masks):
+        gae = 0
+        adv = []
+        for i in reversed(range(len(rewards))):
+            delta = rewards[i] + gamma * values[i + 1] * masks[i] - values[i]
+            gae = delta + gamma * LAMBDA * masks[i] * gae
+            adv.append(gae)
+
+        adv.reverse()
+        return adv   
+
+    adv2D = []
+    for i in range(para.n_envs):
+        adv2D.append(_compute_gae(rewards[:,i,...], values[:,i,...], masks[:,i,...]))
+
+    return np.array(adv2D)
+ 
+
+
+
+
 
 
 class Trainer():
@@ -318,25 +402,20 @@ class Trainer():
         # envs.get_images()
 
         buf.add_frame(obs)
-
-        # frame_stacks = [FrameStack(initial_frames[i], stack_size=frame_stack_size,
-        #                         preprocess_fn=preprocess_frame) for i in range(num_envs)]
-
-
-
+ 
          
         while True:
          
             for _ in range(horizon): 
                 sta = buf.add_frame(obs) 
-                action, value = model.predict(sta) 
-                obs, reward, done, _ = env.step(action)
+                a, a_logP, value = model.predict(sta) 
+                obs, reward, done, _ = env.step(a)
                 buf.add_value(value)
-                buf.add_effects(action, reward, done)
+                buf.add_effects(a, a_logP, reward, done)
                 
             
             sta = buf.add_frame(obs)
-            buf.add_value(model.predict(sta)[1])
+            buf.add_value(model.predict(sta)[2])
 
             data = buf.get_data()
             advantages = compute_gae(data.rew, data.val, 1-data.don, para.gamma, para.gae_lambda)
@@ -363,7 +442,7 @@ class Trainer():
             # assert advantages.shape == (T * N,)
 
             # Train for some number of epochs
-            model.update_old_policy()  # θ_old <- θ
+            # model.update_old_policy()  # θ_old <- θ
 
 
             buf.flatten()
@@ -399,7 +478,7 @@ class Trainer():
     def train_step(self, batch):
 
 
-        
+
 
     def evaluate(self):
 
