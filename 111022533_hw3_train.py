@@ -69,11 +69,12 @@ para = AttrDict({
     'batch_size': 128,
     'n_envs': 8,
 
-    'save_period': 100,    
+    'save_period': 50,  
+    'eval_period': 50,    
     'log_period': 5,
 
-    'ckpt_save_path': "ckpt/checkpoint0.h5",
-    # 'ckpt_load_path': "checkpoint3000"
+    'ckpt_save_path': "ckpt/checkpoint2.h5",
+    'ckpt_load_path': "ckpt/checkpoint1.h5"
 })
 
 
@@ -120,6 +121,11 @@ class FrameSkipEnv:
 
 
 
+def save_frame(dir_name, name, frame):
+    img = Image.fromarray(frame)
+    img.save(os.path.join(dir_name, name))        
+
+
 
 def make_env():
     env = gym.make("MultiCarRacing-v0", num_agents=1, direction='CCW',
@@ -129,28 +135,30 @@ def make_env():
     return env
  
  
-def worker(remote, parent_remote, env_fn_wrapper):
+def worker(i, remote, parent_remote, env_fn_wrapper):
     parent_remote.close()
     env = env_fn_wrapper.x()
+    # t=0
     while True:
         cmd, data = remote.recv()
         if cmd == 'step':
+
             ob, reward, done, info = env.step(data)
+
             if done:
                 ob = env.reset()
-            # ob = np.squeeze(ob)
 
-            # print(f'ob.shape: {ob.shape}, done: {done}')
-            # exit()
+            
+            # if(i==2): 
+            #     # print(f'[c] step recv {data}')
+            #     # print(f'[c] step send {(reward, done, info)}')
+            #     t+=1
+            #     save_frame('video/ps', f'step{t}.jpeg', ob)
+
 
             remote.send((ob, reward, done, info))
         elif cmd == 'reset':
-            ob = env.reset()
-            # ob = np.squeeze(ob)
-
-            # print(f'ob.shape: {np.squeeze(ob).shape}')
-            # exit()           
-
+            ob = env.reset()     
             remote.send(ob)
         elif cmd == 'render':
             remote.send(env.render(mode='rgb_array'))
@@ -183,8 +191,8 @@ class VecEnv():
         self.closed = False 
         self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(len(env_fns))])
 
-        self.ps = [Process(target=worker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
-                   for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)]
+        self.ps = [Process(target=worker, args=(i, work_remote, remote, CloudpickleWrapper(env_fn)))
+                   for i, (work_remote, remote, env_fn) in enumerate(zip(self.work_remotes, self.remotes, env_fns))]
 
         for p in self.ps:
             p.daemon = True  # if the main process crashes, we should not cause things to hang
@@ -199,9 +207,13 @@ class VecEnv():
         #     remote.send(('step', action))
 
         for i in range(len(self.remotes)):
+            # if(i==2): print(f'[p] step {actions[i]}')
             self.remotes[i].send(('step', actions[i]))
         
         results = [remote.recv() for remote in self.remotes]
+
+        # print(f'[p] step recv {results[2][1:]}')
+        # print('-----------')
         obs, rews, dones, infos = zip(*results)
 
         # print(f'np.stack(rews).shape: {np.stack(rews).shape}')
@@ -228,6 +240,9 @@ class VecEnv():
         for p in self.ps:
             p.join()
         self.closed = True
+
+
+
 
 
 
@@ -517,11 +532,6 @@ def compute_gae(rews, vals, masks, gamma, LAMBDA):
 
 
 
-def save_frame(dir_name, name, frame):
-    img = Image.fromarray(frame)
-    img.save(os.path.join(dir_name, name))        
-
-
 class Trainer():
 
     def __init__(self):
@@ -538,7 +548,8 @@ class Trainer():
         obs = env.reset()
     
  
-        with open("log.txt", "w") as f: f.write("")
+        # with open("eval.txt", "w") as f: f.write("")
+        # with open("log.txt", "w") as f: f.write("")
         log = {}
 
         for t in range(para.n_iters):
@@ -572,7 +583,7 @@ class Trainer():
 
 
             if t % para.save_period == 0:
-                self.agent.save_checkpoint(f"ckpt/checkpoint{t}.h5")
+                self.agent.save_checkpoint(para.ckpt_save_path)
                 
             
             if t % para.log_period == 0:
@@ -583,7 +594,10 @@ class Trainer():
                 log['loss'] = np.mean(losses)
                 with open("log.txt", "a") as f: f.write(f't: {t}, ' + str(log) + '\n')
 
-        
+            if t % para.eval_period == 0:
+                total_reward = self.evaluate(t)
+                with open("eval.txt", "a") as f: f.write(f't: {t}, cum_reward: {total_reward}\n')
+                self.agent.save_checkpoint(f"ckpt/eval-{t}.h5")
 
     def compute_cum_reward(self, rew, don):  
         cum_rewards = [np.sum(rew[j]) for j in range(para.n_envs)]
@@ -591,44 +605,42 @@ class Trainer():
  
 
 
-    def evaluate(self):
+    def evaluate(self, t=0):
 
         print('evaluating...')
 
         env = make_env()
 
-        obs = env.reset()
+        total_rewards = []
+        for i in range(5):
 
-        stack = deque(maxlen=para.k) 
-        
-        for _ in range(para.k):
-            stack.append(np.zeros((para.img_shape)))
+            obs = env.reset()
 
-        # video_writer = cv2.VideoWriter(os.path.join("video", "step3000.avi"),
-        #                                cv2.VideoWriter_fourcc(*"MPEG"), 30,
-        #                                (obs.shape[1], obs.shape[0]))
-        # state = np.stack(stack, axis=-1)
-
-
-        total_reward = 0
-        t = 0
-        while True:
-
-            stack.append(preprocess_frame(obs))
-            state = np.stack(stack, axis=-1)[np.newaxis,...]
-            # print(f'state.shape: {state.shape}')
-            a, _, _ = self.agent.predict(state) 
-            obs, reward, done, _ = env.step(a)
+            stack = deque(maxlen=para.k) 
             
-            total_reward += reward
-          
-            save_frame('video', f'step{t}.jpeg', obs)
-            t += 1
-            # video_writer.write(cv2.cvtColor(obs, cv2.COLOR_RGB2BGR))
-            if done: break
+            for _ in range(para.k):
+                stack.append(np.zeros((para.img_shape)))
+ 
+            total_reward = 0
+            step = 0
+            while True:
 
-        # video_writer.release()
+                stack.append(preprocess_frame(obs))
+                state = np.stack(stack, axis=-1)[np.newaxis,...]
+                a, _, _ = self.agent.predict(state) 
+                obs, reward, done, _ = env.step(a)
                 
+                total_reward += reward
+
+                # save_frame('video', f't-{t}-step{step}.jpeg', obs)
+                step += 1
+                if done: break
+ 
+            total_rewards.append(total_reward) 
+
+        return np.mean(total_rewards)
+
+
 trainer = Trainer()
 trainer.train()
 # trainer.evaluate()
