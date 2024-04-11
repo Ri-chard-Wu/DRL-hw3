@@ -8,7 +8,9 @@ import tensorflow.keras.backend as K
 import tensorflow as tf
 import importlib
 
- 
+import cv2
+import os
+from PIL import Image
 # env = gym.make("MultiCarRacing-v0", num_agents=1, direction='CCW',
 #         use_random_direction=True, backwards_flag=True, h_ratio=0.25,
 #         use_ego_color=False)
@@ -71,7 +73,7 @@ para = AttrDict({
     'log_period': 5,
 
     'ckpt_save_path': "ckpt/checkpoint0.h5",
-    # 'ckpt_load_path': "ckpt/checkpoint1.h5"
+    # 'ckpt_load_path': "checkpoint3000"
 })
 
 
@@ -98,9 +100,12 @@ class FrameSkipEnv:
         for i in range(self.skip):
         
             obs, reward, done, info = self.env.step(action)  
-            cum_reward += reward
+              
+            cum_reward += reward[0]
 
             if done: break
+
+        obs = np.squeeze(obs)
 
         # cum_reward = min(max(cum_reward, -1), 1)
         return obs, cum_reward, done, info
@@ -108,7 +113,10 @@ class FrameSkipEnv:
     def reset(self):
         # self.t = 0
         # self.episode += 1
-        return self.env.reset()
+
+        obs = self.env.reset()
+        obs = np.squeeze(obs)        
+        return obs
 
 
 
@@ -130,15 +138,15 @@ def worker(remote, parent_remote, env_fn_wrapper):
             ob, reward, done, info = env.step(data)
             if done:
                 ob = env.reset()
-            ob = np.squeeze(ob)
+            # ob = np.squeeze(ob)
 
             # print(f'ob.shape: {ob.shape}, done: {done}')
             # exit()
 
-            remote.send((ob, reward[0], done, info))
+            remote.send((ob, reward, done, info))
         elif cmd == 'reset':
             ob = env.reset()
-            ob = np.squeeze(ob)
+            # ob = np.squeeze(ob)
 
             # print(f'ob.shape: {np.squeeze(ob).shape}')
             # exit()           
@@ -236,12 +244,12 @@ class Backbone(tf.keras.layers.Layer):
     def build(self, input_shape):
 
         self.seq = []
-        self.seq.append(tf.keras.layers.Conv2D(filters=32, kernel_size=8, strides=4))
+        self.seq.append(tf.keras.layers.Conv2D(filters=16, kernel_size=8, strides=4))
         self.seq.append(tf.keras.layers.LeakyReLU())
-        self.seq.append(tf.keras.layers.Conv2D(filters=64, kernel_size=4, strides=2))
+        self.seq.append(tf.keras.layers.Conv2D(filters=32, kernel_size=3, strides=2))
         self.seq.append(tf.keras.layers.LeakyReLU())
-        self.seq.append(tf.keras.layers.Conv2D(filters=64, kernel_size=2, strides=1))
-        self.seq.append(tf.keras.layers.LeakyReLU())
+        # self.seq.append(tf.keras.layers.Conv2D(filters=64, kernel_size=2, strides=1))
+        # self.seq.append(tf.keras.layers.LeakyReLU())
   
        
     def call(self, x, training=False): # x.shape: (64, 65, 64) = (64, 65, hidden_size)
@@ -260,7 +268,7 @@ class Agent(tf.keras.Model):
 
         self.backbone = Backbone()
         self.flatten = tf.keras.layers.Flatten()
-        self.fc = tf.keras.layers.Dense(units=512, activation='relu', name="fc")
+        # self.fc = tf.keras.layers.Dense(units=512, activation='relu', name="fc")
         self.a_mean_head = tf.keras.layers.Dense(units=num_actions, activation='tanh', name="a_mean_head")
         self.a_std = self.add_weight("a_std", shape=[num_actions,], trainable=False,
                       initializer = tf.keras.initializers.Constant(value=0.5), dtype=tf.float32)
@@ -276,7 +284,7 @@ class Agent(tf.keras.Model):
         
         x = self.backbone(x)
         x = self.flatten(x)
-        x = self.fc(x)
+        # x = self.fc(x)
         a_mean, v = self.a_mean_head(x), self.v_head(x)
 
         a_mean = a_min + ((a_mean + 1) / 2) * (a_max - a_min)
@@ -331,21 +339,21 @@ class Agent(tf.keras.Model):
             a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,) 
             ent = dist.entropy()       
 
-            val_clip = val + tf.clip_by_value(val - val_old, 1-eps, 1+eps)
-            val_loss1 = tf.square(ret - val) # (b,)
-            val_loss2 = tf.square(ret - val_clip) # (b,)
-            val_max = tf.maximum(val_loss1, val_loss2)
-            # print(f'val_max.shape: {val_max.shape}')
-            val_loss = tf.reduce_mean(val_max)             
+            # val_clip = val + tf.clip_by_value(val - val_old, 1-eps, 1+eps)
+            # val_loss1 = tf.square(ret - val) # (b,)
+            # val_loss2 = tf.square(ret - val_clip) # (b,)
+            # val_max = tf.maximum(val_loss1, val_loss2) 
+            # val_loss = tf.reduce_mean(val_max)             
+  
+            val_loss = tf.reduce_mean(tf.square(ret - val))  
 
-            r = tf.exp(a_logP - a_logP_old) # (b,)            
-            pg_min = tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv)
-            # print(f'pg_min.shape: {pg_min.shape}')
-            pg_loss = - tf.reduce_mean(pg_min)
 
-            ent_sum = tf.reduce_sum(ent, axis=-1)
-            # print(f'ent_sum.shape: {ent_sum.shape}')
-            ent_loss = - tf.reduce_mean(ent_sum)
+
+
+            r = tf.exp(a_logP - a_logP_old) # (b,)                        
+            pg_loss = - tf.reduce_mean(tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv))
+
+            ent_loss = - tf.reduce_mean(tf.reduce_sum(ent, axis=-1))
 
             total_loss = pg_loss + para.w_val * val_loss + para.w_ent * ent_loss
 
@@ -438,9 +446,10 @@ class VecBuf():
         
         assert adv.shape == self.val[:-1].shape
 
+        self.adv = (adv - adv.mean()) / (adv.std() + 1e-8)  
         self.ret = adv + self.val[:-1]
         # print(f'adv.shape: {adv.shape}')
-        self.adv = (adv - adv.mean()) / (adv.std() + 1e-8)  
+        
     
     def get_data(self):
     
@@ -508,6 +517,10 @@ def compute_gae(rews, vals, masks, gamma, LAMBDA):
 
 
 
+def save_frame(dir_name, name, frame):
+    img = Image.fromarray(frame)
+    img.save(os.path.join(dir_name, name))        
+
 
 class Trainer():
 
@@ -572,42 +585,52 @@ class Trainer():
 
         
 
-    def compute_cum_reward(self, rew, don): 
-
-        # cum_rewards = []
-        # traj_lens = []
-
-        # cum_reward = [0] * para.n_envs
-        # traj_len = [0] * para.n_envs
-        
-        # print(f'don: {don}')
-
+    def compute_cum_reward(self, rew, don):  
         cum_rewards = [np.sum(rew[j]) for j in range(para.n_envs)]
         return np.mean(cum_rewards), np.std(cum_rewards)
-
-        # for i in range(para.horizon):
-        #     for j in range(para.n_envs):
-
-        #         if don[i, j]:
-
-        #             cum_rewards.append(cum_reward[j] + rew[i, j])
-        #             traj_lens.append(traj_len[j] + 1)
-
-        #             cum_reward[j] = 0
-        #             traj_len[j] = 0
-
-        #         else:
-        #             cum_reward[j] += rew[i, j]
-        #             traj_len[j] += 1
+ 
 
 
-        # if(len(cum_rewards) == 0):
-        #     return 0, 0
-        # else:
-        #     # print(f'len(cum_rewards): {len(cum_rewards)}')
-        #     return np.mean(cum_rewards), np.std(cum_rewards)
+    def evaluate(self):
+
+        print('evaluating...')
+
+        env = make_env()
+
+        obs = env.reset()
+
+        stack = deque(maxlen=para.k) 
+        
+        for _ in range(para.k):
+            stack.append(np.zeros((para.img_shape)))
+
+        # video_writer = cv2.VideoWriter(os.path.join("video", "step3000.avi"),
+        #                                cv2.VideoWriter_fourcc(*"MPEG"), 30,
+        #                                (obs.shape[1], obs.shape[0]))
+        # state = np.stack(stack, axis=-1)
 
 
+        total_reward = 0
+        t = 0
+        while True:
 
+            stack.append(preprocess_frame(obs))
+            state = np.stack(stack, axis=-1)[np.newaxis,...]
+            # print(f'state.shape: {state.shape}')
+            a, _, _ = self.agent.predict(state) 
+            obs, reward, done, _ = env.step(a)
+            
+            total_reward += reward
+          
+            save_frame('video', f'step{t}.jpeg', obs)
+            t += 1
+            # video_writer.write(cv2.cvtColor(obs, cv2.COLOR_RGB2BGR))
+            if done: break
+
+        # video_writer.release()
+                
 trainer = Trainer()
 trainer.train()
+# trainer.evaluate()
+
+
