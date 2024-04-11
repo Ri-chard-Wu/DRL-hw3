@@ -237,11 +237,11 @@ class Backbone(tf.keras.layers.Layer):
 
         self.seq = []
         self.seq.append(tf.keras.layers.Conv2D(filters=32, kernel_size=8, strides=4))
-        self.seq.append(tf.keras.layers.ReLU())
+        self.seq.append(tf.keras.layers.LeakyReLU())
         self.seq.append(tf.keras.layers.Conv2D(filters=64, kernel_size=4, strides=2))
-        self.seq.append(tf.keras.layers.ReLU())
+        self.seq.append(tf.keras.layers.LeakyReLU())
         self.seq.append(tf.keras.layers.Conv2D(filters=64, kernel_size=2, strides=1))
-        self.seq.append(tf.keras.layers.ReLU())
+        self.seq.append(tf.keras.layers.LeakyReLU())
   
        
     def call(self, x, training=False): # x.shape: (64, 65, 64) = (64, 65, hidden_size)
@@ -260,6 +260,7 @@ class Agent(tf.keras.Model):
 
         self.backbone = Backbone()
         self.flatten = tf.keras.layers.Flatten()
+        self.fc = tf.keras.layers.Dense(units=512, activation='relu', name="fc")
         self.a_mean_head = tf.keras.layers.Dense(units=num_actions, activation='tanh', name="a_mean_head")
         self.a_std = self.add_weight("a_std", shape=[num_actions,], trainable=False,
                       initializer = tf.keras.initializers.Constant(value=0.5), dtype=tf.float32)
@@ -275,6 +276,7 @@ class Agent(tf.keras.Model):
         
         x = self.backbone(x)
         x = self.flatten(x)
+        x = self.fc(x)
         a_mean, v = self.a_mean_head(x), self.v_head(x)
 
         a_mean = a_min + ((a_mean + 1) / 2) * (a_max - a_min)
