@@ -69,55 +69,51 @@ para = AttrDict({
     'batch_size': 128,
     'n_envs': 8,
 
-    'save_period': 50,  
+    'save_period': 20,  
     'eval_period': 50,    
     'log_period': 5,
 
-    'ckpt_save_path': "ckpt/checkpoint2.h5",
-    'ckpt_load_path': "ckpt/checkpoint1.h5"
+    'ckpt_save_path': "ckpt/checkpoint3.h5",
+    'ckpt_load_path': "ckpt/checkpoint2.h5"
 })
 
 
 
+class SingleCarEnv:
+    def __init__(self, env):   
+        self.env = env  
+        
+    def step(self, action):    
+        obs, reward, done, info = self.env.step(action)                      
+        return np.squeeze(obs), reward[0], done, info
+ 
+    def reset(self): 
+        obs = self.env.reset()
+        return np.squeeze(obs)
 
  
-
 class FrameSkipEnv:
     def __init__(self, env):   
         self.env = env 
         self.skip = para.skip
         
     def step(self, action):
-        """
-        - 4 steps at a time. 
-        - take last obs, done and info, sum all 4 rewards.
-        - clip reward between -1, 1.
-        - return if encounter done before 4 steps.
-        """        
-        # self.t += 1
-
+  
         cum_reward = 0
 
         for i in range(self.skip):
         
-            obs, reward, done, info = self.env.step(action)  
-              
-            cum_reward += reward[0]
-
+            obs, reward, done, info = self.env.step(action)                
+            cum_reward += reward
             if done: break
 
-        obs = np.squeeze(obs)
-
-        # cum_reward = min(max(cum_reward, -1), 1)
         return obs, cum_reward, done, info
  
     def reset(self):
-        # self.t = 0
-        # self.episode += 1
-
-        obs = self.env.reset()
-        obs = np.squeeze(obs)        
+        obs = self.env.reset()     
         return obs
+
+
 
 
 
@@ -131,6 +127,8 @@ def make_env():
     env = gym.make("MultiCarRacing-v0", num_agents=1, direction='CCW',
         use_random_direction=True, backwards_flag=True, h_ratio=0.25,
         use_ego_color=False)    
+
+    env = SingleCarEnv(env)
     env =  FrameSkipEnv(env)
     return env
  
@@ -247,6 +245,16 @@ class VecEnv():
 
 
 
+def preprocess_frame(img):     
+    img = img[:-12, 6:-6] # (84, 84, 3)
+    img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140])
+    img = img / 255.0
+    img = img * 2 - 1    
+    # print(f'img.shape: {img.shape}') 
+    assert img.shape == (84, 84)
+    return img
+
+
 
 
 
@@ -286,14 +294,38 @@ class Agent(tf.keras.Model):
         # self.fc = tf.keras.layers.Dense(units=512, activation='relu', name="fc")
         self.a_mean_head = tf.keras.layers.Dense(units=num_actions, activation='tanh', name="a_mean_head")
         self.a_std = self.add_weight("a_std", shape=[num_actions,], trainable=False,
-                      initializer = tf.keras.initializers.Constant(value=0.5), dtype=tf.float32)
+                      initializer = tf.keras.initializers.Constant(value=0.4), dtype=tf.float32)
         
         self.v_head = tf.keras.layers.Dense(units=1, name="v_head")
         self.update_counts = 0
         
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=para.lr)
 
-   
+        self.i = 0
+        self.prev_action = np.array([0.0, 0.0, 0.0])
+        self.recent_frames = deque(maxlen=para.k) 
+        for _ in range(para.k):
+            self.recent_frames.append(np.zeros((para.img_shape)))
+
+
+    def act(self, obs):
+
+        obs = np.squeeze(obs)
+
+        if(self.i % para.skip == 0):
+            self.i = 1
+            self.recent_frames.append(preprocess_frame(obs)) 
+            s = np.stack(self.recent_frames, axis=-1)[np.newaxis,...]            
+            a, _, _ = self.predict(s, greedy=False)            
+            self.prev_action = a
+  
+        else:
+            self.i += 1 
+            
+        return self.prev_action
+
+
+
     @tf.function
     def call(self, x, training=False):
         
@@ -311,7 +343,7 @@ class Agent(tf.keras.Model):
 
      
 
-    def predict(self, state):
+    def predict(self, state, greedy=False):
         
         state = tf.convert_to_tensor(state, tf.float32)         
         # a, a_logP, ent, v = self(state)
@@ -319,7 +351,11 @@ class Agent(tf.keras.Model):
 
         dist = tf.compat.v1.distributions.Normal(a_mean, self.a_std, validate_args=True)
 
-        a = tf.squeeze(dist.sample(1)) # (b, num_actions)        
+        if(greedy):
+            a = a_mean
+        else:
+            a = tf.squeeze(dist.sample(1)) # (b, num_actions)  
+
         a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,) 
                 
         return a.numpy(), a_logP.numpy(), v.numpy()
@@ -391,16 +427,6 @@ class Agent(tf.keras.Model):
 
 
 
-
-
-def preprocess_frame(img):     
-    img = img[:-12, 6:-6] # (84, 84, 3)
-    img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140])
-    img = img / 255.0
-    img = img * 2 - 1    
-    # print(f'img.shape: {img.shape}') 
-    assert img.shape == (84, 84)
-    return img
 
 
 
@@ -540,6 +566,20 @@ class Trainer():
         if('ckpt_load_path' in para): 
             self.agent.load_checkpoint(para.ckpt_load_path)
 
+        for w in self.agent.weights:
+            key = w.name[:-2]            
+            if(key == 'a_std'):
+                w.assign(tf.convert_to_tensor(np.array([0.4, 0.4, 0.4], dtype=np.float32)))
+                
+
+
+        # for w in self.agent.weights:
+        #     key = w.name[:-2]
+        #     if(key == 'a_std'): 
+        #         print(f'after a_std: {w}')
+
+        # exit()
+
 
 
     def train(self):    
@@ -604,41 +644,74 @@ class Trainer():
         return np.mean(cum_rewards), np.std(cum_rewards)
  
 
-
     def evaluate(self, t=0):
 
         print('evaluating...')
-
-        env = make_env()
-
+    
+        env = gym.make("MultiCarRacing-v0", num_agents=1, direction='CCW',
+            use_random_direction=True, backwards_flag=True, h_ratio=0.25,
+            use_ego_color=False)       
+        
         total_rewards = []
         for i in range(5):
 
             obs = env.reset()
 
-            stack = deque(maxlen=para.k) 
-            
-            for _ in range(para.k):
-                stack.append(np.zeros((para.img_shape)))
- 
+           
             total_reward = 0
-            step = 0
+            # step = 0
             while True:
-
-                stack.append(preprocess_frame(obs))
-                state = np.stack(stack, axis=-1)[np.newaxis,...]
-                a, _, _ = self.agent.predict(state) 
+ 
+                a = self.agent.act(obs) 
                 obs, reward, done, _ = env.step(a)
                 
-                total_reward += reward
+                total_reward += reward[0]
 
                 # save_frame('video', f't-{t}-step{step}.jpeg', obs)
-                step += 1
+                # step += 1
                 if done: break
  
             total_rewards.append(total_reward) 
 
         return np.mean(total_rewards)
+
+
+
+
+    # def evaluate(self, t=0):
+
+    #     print('evaluating...')
+
+    #     env = make_env()
+
+    #     total_rewards = []
+    #     for i in range(5):
+
+    #         obs = env.reset()
+
+    #         stack = deque(maxlen=para.k) 
+            
+    #         for _ in range(para.k):
+    #             stack.append(np.zeros((para.img_shape)))
+ 
+    #         total_reward = 0
+    #         step = 0
+    #         while True:
+
+    #             stack.append(preprocess_frame(obs))
+    #             state = np.stack(stack, axis=-1)[np.newaxis,...]
+    #             a, _, _ = self.agent.predict(state) 
+    #             obs, reward, done, _ = env.step(a)
+                
+    #             total_reward += reward
+
+    #             # save_frame('video', f't-{t}-step{step}.jpeg', obs)
+    #             step += 1
+    #             if done: break
+ 
+    #         total_rewards.append(total_reward) 
+
+    #     return np.mean(total_rewards)
 
 
 trainer = Trainer()
