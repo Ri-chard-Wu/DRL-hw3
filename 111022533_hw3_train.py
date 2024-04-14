@@ -63,7 +63,7 @@ para = AttrDict({
     'ppo_clip': 0.2,
     'w_val': 0.5,
     'w_ent': 0.01,
-    'horizon': 128,
+    'horizon': 256,
     'epochs': 10,
     'n_iters': int(1e7),
     'batch_size': 128,
@@ -73,8 +73,10 @@ para = AttrDict({
     'eval_period': 20,    
     'log_period': 5,
 
-    'ckpt_save_path': "ckpt/checkpoint2.h5",
-    'ckpt_load_path': "ckpt/checkpoint1.h5"
+    'a_std': 0.3, 
+
+    'ckpt_save_path': "ckpt/checkpoint4.h5",
+    'ckpt_load_path': "ckpt/checkpoint3.h5"
 })
 
 
@@ -266,16 +268,7 @@ class Backbone(tf.keras.layers.Layer):
 
     def build(self, input_shape):
 
-        self.seq = []
-        # self.seq.append(tf.keras.layers.Conv2D(filters=16, kernel_size=8, strides=4))
-        # self.seq.append(tf.keras.layers.ReLU())
-        # self.seq.append(tf.keras.layers.Conv2D(filters=32, kernel_size=3, strides=2))
-        # self.seq.append(tf.keras.layers.ReLU())
-        # self.seq.append(tf.keras.layers.Conv2D(filters=64, kernel_size=3, strides=2))
-        # self.seq.append(tf.keras.layers.ReLU())
-        # self.seq.append(tf.keras.layers.Conv2D(filters=128, kernel_size=3, strides=1))
-        # self.seq.append(tf.keras.layers.ReLU())
-
+        self.seq = [] 
         self.seq.append(tf.keras.layers.Conv2D(filters=16, kernel_size=8, strides=4))
         self.seq.append(tf.keras.layers.LeakyReLU())
         self.seq.append(tf.keras.layers.Conv2D(filters=32, kernel_size=3, strides=2))
@@ -289,158 +282,7 @@ class Backbone(tf.keras.layers.Layer):
 
 
 
-
-
-class Agent_old(tf.keras.Model):
-
-    def __init__(self):  
-
-        super().__init__()
-
-        self.backbone = Backbone()
-        self.flatten = tf.keras.layers.Flatten()
-
-        # self.fc = tf.keras.layers.Dense(units=512, activation='relu', name="fc")
-        # self.a_mean_head = tf.keras.layers.Dense(units=num_actions, activation='tanh', name="a_mean_head")
-        self.a_mean_head = tf.keras.Sequential([
-            tf.keras.layers.Dense(128, activation='tanh', kernel_initializer=tf.keras.initializers.VarianceScaling(scale=1.0), name='a_mean/dense_1'),
-            tf.keras.layers.Dense(128, activation='tanh', kernel_initializer=tf.keras.initializers.VarianceScaling(scale=1.0), name='a_mean/dense_2'),
-            tf.keras.layers.Dense(num_actions, activation='tanh', kernel_initializer=tf.keras.initializers.VarianceScaling(scale=1.0), name='a_mean/dense_3')
-        ])
-
-        self.a_std = self.add_weight("a_std", shape=[num_actions,], trainable=False,
-                      initializer = tf.keras.initializers.Constant(value=0.4), dtype=tf.float32)
-        
-        # self.v_head = tf.keras.layers.Dense(units=1, name="v_head")
-        self.v_head = tf.keras.Sequential([
-            tf.keras.layers.Dense(128, activation='tanh', name='v/dense_1'),
-            tf.keras.layers.Dense(128, activation='tanh', name='v/dense_2'),
-            tf.keras.layers.Dense(1, name='v/dense_3')
-        ])
-
-        self.update_counts = 0
-        
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=para.lr)
-
-        self.i = 0
-        self.prev_action = np.array([0.0, 0.0, 0.0])
-        self.recent_frames = deque(maxlen=para.k) 
-        for _ in range(para.k):
-            self.recent_frames.append(np.zeros((para.img_shape)))
-
-
-    def act(self, obs):
-
-        obs = np.squeeze(obs)
-
-        if(self.i % para.skip == 0):
-            self.i = 1
-            self.recent_frames.append(preprocess_frame(obs)) 
-            s = np.stack(self.recent_frames, axis=-1)[np.newaxis,...]            
-            a, _, _ = self.predict(s, greedy=False)            
-            self.prev_action = a
-  
-        else:
-            self.i += 1 
-            
-        return self.prev_action
-
-
-
-    @tf.function
-    def call(self, x, training=False):
-        
-        x = self.backbone(x)
-        x = self.flatten(x)
-        # x = self.fc(x)
-        a_mean, v = self.a_mean_head(x), self.v_head(x)
-
-        a_mean = a_min + ((a_mean + 1) / 2) * (a_max - a_min)
-        return a_mean, tf.squeeze(v, axis=-1)
-
-     
-
-    def predict(self, state, greedy=False):
-        
-        state = tf.convert_to_tensor(state, tf.float32)         
-        # a, a_logP, ent, v = self(state)
-        a_mean, v = self(state)
-
-        dist = tf.compat.v1.distributions.Normal(a_mean, self.a_std, validate_args=True)
-
-        if(greedy):
-            a = a_mean
-        else:
-            a = tf.squeeze(dist.sample(1)) # (b, num_actions)  
-
-        a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,) 
-                
-        return a.numpy(), a_logP.numpy(), v.numpy()
  
-
-
-    def train_step(self, batch):
-        self.update_counts += 1
-        loss = self._train_step(batch)
-        return loss.numpy()
-
-    @tf.function
-    def _train_step(self, batch):
-        
-        sta, a, a_logP_old, val_old, ret, adv = batch
-
-        with tf.GradientTape() as tape:
-
-            # sta = tf.convert_to_tensor(self.sta[idxes], tf.float32) # (b, 84, 84, 4)
-            # act = tf.convert_to_tensor(self.act[idxes], tf.float32) # (b, 3)
-            # alg = tf.convert_to_tensor(self.alg[idxes], tf.float32) # (b,)
-            # val = tf.convert_to_tensor(self.val[idxes], tf.float32) # (b,)
-            # ret = tf.convert_to_tensor(self.ret[idxes], tf.float32) # (b,)
-            # adv = tf.convert_to_tensor(self.adv[idxes], tf.float32) # (b,)
-
-            eps = para.ppo_clip
- 
-            a_mean, val = self(sta, True)
-
-            dist = tf.compat.v1.distributions.Normal(a_mean, self.a_std, validate_args=True)
-
-            a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,) 
-            ent = dist.entropy()       
-
-            # val_clip = val + tf.clip_by_value(val - val_old, 1-eps, 1+eps)
-            # val_loss1 = tf.square(ret - val) # (b,)
-            # val_loss2 = tf.square(ret - val_clip) # (b,)
-            # val_max = tf.maximum(val_loss1, val_loss2) 
-            # val_loss = tf.reduce_mean(val_max)             
-  
-            val_loss = tf.reduce_mean(tf.square(ret - val))  
-
-
-
-
-            r = tf.exp(a_logP - a_logP_old) # (b,)                        
-            pg_loss = - tf.reduce_mean(tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv))
-
-            ent_loss = - tf.reduce_mean(tf.reduce_sum(ent, axis=-1))
-
-            total_loss = pg_loss + para.w_val * val_loss + para.w_ent * ent_loss
-
-        gradients = tape.gradient(total_loss, self.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-    
-        return total_loss
-
-
-    def save_checkpoint(self, path):  
-        print(f'- saved ckpt {path}') 
-        self.save_weights(path)
-         
-
-    def load_checkpoint(self, path):         
-        print(f'- loaded ckpt {path}') 
-        self(tf.random.uniform(shape=[1, *para.img_shape, para.k]))
-        self.load_weights(path)
-
 
 
 class PoliycyNet(tf.keras.Model):
@@ -486,26 +328,11 @@ class Agent(tf.keras.Model):
 
         super().__init__()
 
-        # self.policy_net = tf.keras.Sequential([
-        #     Backbone(),
-        #     tf.keras.layers.Flatten(),
-        #     tf.keras.layers.Dense(128, activation='tanh', kernel_initializer=tf.keras.initializers.VarianceScaling(scale=1.0)),
-        #     tf.keras.layers.Dense(128, activation='tanh', kernel_initializer=tf.keras.initializers.VarianceScaling(scale=1.0)),
-        #     tf.keras.layers.Dense(num_actions, activation='tanh', kernel_initializer=tf.keras.initializers.VarianceScaling(scale=1.0))
-        # ])
-
         self.policy_net = PoliycyNet()
 
         self.a_std = self.add_weight("a_std", shape=[num_actions,], trainable=False,
                       initializer = tf.keras.initializers.Constant(value=0.5), dtype=tf.float32)
         
-        # self.value_net = tf.keras.Sequential([
-        #     Backbone(),
-        #     tf.keras.layers.Flatten(),            
-        #     tf.keras.layers.Dense(128, activation='tanh'),
-        #     tf.keras.layers.Dense(128, activation='tanh'),
-        #     tf.keras.layers.Dense(1)
-        # ])
         self.value_net = ValueNet()
 
         self.update_counts = 0
@@ -513,9 +340,6 @@ class Agent(tf.keras.Model):
         self.opt_val = tf.keras.optimizers.Adam(learning_rate=para.lr)
         self.opt_pol = tf.keras.optimizers.Adam(learning_rate=para.lr)
 
- 
- 
- 
         self.i = 0
         self.prev_action = np.array([0.0, 0.0, 0.0])
         self.recent_frames = deque(maxlen=para.k) 
@@ -579,6 +403,13 @@ class Agent(tf.keras.Model):
     @tf.function
     def _train_step(self, batch):
         
+        # sta = tf.convert_to_tensor(self.sta[idxes], tf.float32) # (b, 84, 84, 4)
+        # act = tf.convert_to_tensor(self.act[idxes], tf.float32) # (b, 3)
+        # alg = tf.convert_to_tensor(self.alg[idxes], tf.float32) # (b,)
+        # val = tf.convert_to_tensor(self.val[idxes], tf.float32) # (b,)
+        # ret = tf.convert_to_tensor(self.ret[idxes], tf.float32) # (b,)
+        # adv = tf.convert_to_tensor(self.adv[idxes], tf.float32) # (b,)
+
         sta, a, a_logP_old, val_old, ret, adv = batch
 
         eps = para.ppo_clip
@@ -593,8 +424,6 @@ class Agent(tf.keras.Model):
         self.opt_val.apply_gradients(zip(val_grads, self.value_net.trainable_variables))
 
   
-
-
         with tf.GradientTape() as tape:
   
             a_mean = self.policy_net(sta, training=True)        
@@ -613,59 +442,7 @@ class Agent(tf.keras.Model):
         self.opt_pol.apply_gradients(zip(pol_grads, self.policy_net.trainable_variables))
 
 
-        return pol_loss, val_loss
-
-
-
-
-
-
-    # @tf.function
-    # def _train_step(self, batch):
-        
-    #     sta, a, a_logP_old, val_old, ret, adv = batch
-
-    #     with tf.GradientTape() as tape:
-
-    #         # sta = tf.convert_to_tensor(self.sta[idxes], tf.float32) # (b, 84, 84, 4)
-    #         # act = tf.convert_to_tensor(self.act[idxes], tf.float32) # (b, 3)
-    #         # alg = tf.convert_to_tensor(self.alg[idxes], tf.float32) # (b,)
-    #         # val = tf.convert_to_tensor(self.val[idxes], tf.float32) # (b,)
-    #         # ret = tf.convert_to_tensor(self.ret[idxes], tf.float32) # (b,)
-    #         # adv = tf.convert_to_tensor(self.adv[idxes], tf.float32) # (b,)
-
-    #         eps = para.ppo_clip
- 
-    #         a_mean, val = self(sta, True)
-
-    #         dist = tf.compat.v1.distributions.Normal(a_mean, self.a_std, validate_args=True)
-
-    #         a_logP = tf.reduce_sum(dist.log_prob(a), axis=-1) # (b,) 
-    #         ent = dist.entropy()       
-        
-  
-    #         val_loss = tf.reduce_mean(tf.square(ret - val))  
- 
-
-    #         r = tf.exp(a_logP - a_logP_old) # (b,)                        
-    #         pol_loss = - tf.reduce_mean(tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv)) - tf.reduce_mean(tf.reduce_sum(ent, axis=-1))
- 
-
-    #         # total_loss = pg_loss + para.w_val * val_loss + para.w_ent * ent_loss
-
-    #     # gradients = tape.gradient(total_loss, self.trainable_variables)
-    #     # self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-    
-    #     val_grads = tape.gradient(val_loss, self.value_net.trainable_variables)
-    #     self.opt_val.apply_gradients(zip(val_grads, self.value_net.trainable_variables))
-
-    #     pol_grads = tape.gradient(pol_loss, self.policy_net.trainable_variables)
-    #     self.opt_pol.apply_gradients(zip(pol_grads, self.policy_net.trainable_variables))
-
-
-    #     return pol_loss, val_loss
-
-
+        return pol_loss, val_loss 
 
 
     def save_checkpoint(self, path):  
@@ -807,82 +584,25 @@ def compute_gae(rews, vals, masks, gamma, LAMBDA):
     return adv # (horizon, n_envs)
  
 
-
-
-
-
-layer_map = {'policy_net/backbone/conv2d/kernel:0': 'backbone/conv2d/kernel:0',
-            'policy_net/backbone/conv2d/bias:0': 'backbone/conv2d/bias:0',
-            'policy_net/backbone/conv2d_1/kernel:0': 'backbone/conv2d_1/kernel:0',
-            'policy_net/backbone/conv2d_1/bias:0': 'backbone/conv2d_1/bias:0',
-            'policy_net/backbone/conv2d_2/kernel:0': 'backbone/conv2d_2/kernel:0',
-            'policy_net/backbone/conv2d_2/bias:0': 'backbone/conv2d_2/bias:0',
-            'policy_net/dense/kernel:0': 'a_mean/dense_1/kernel:0',
-            'policy_net/dense/bias:0': 'a_mean/dense_1/bias:0',
-            'policy_net/dense_1/kernel:0': 'a_mean/dense_2/kernel:0',
-            'policy_net/dense_1/bias:0': 'a_mean/dense_2/bias:0',
-            'policy_net/dense_2/kernel:0': 'a_mean/dense_3/kernel:0',
-            'policy_net/dense_2/bias:0': 'a_mean/dense_3/bias:0',
-            'value_net/backbone/conv2d_3/kernel:0': 'backbone/conv2d/kernel:0',
-            'value_net/backbone/conv2d_3/bias:0': 'backbone/conv2d/bias:0',
-            'value_net/backbone/conv2d_4/kernel:0': 'backbone/conv2d_1/kernel:0',
-            'value_net/backbone/conv2d_4/bias:0': 'backbone/conv2d_1/bias:0',
-            'value_net/backbone/conv2d_5/kernel:0': 'backbone/conv2d_2/kernel:0',
-            'value_net/backbone/conv2d_5/bias:0': 'backbone/conv2d_2/bias:0',
-            'value_net/dense_3/kernel:0': 'v/dense_1/kernel:0',
-            'value_net/dense_3/bias:0': 'v/dense_1/bias:0',
-            'value_net/dense_4/kernel:0': 'v/dense_2/kernel:0',
-            'value_net/dense_4/bias:0': 'v/dense_2/bias:0',
-            'value_net/dense_5/kernel:0': 'v/dense_3/kernel:0',
-            'value_net/dense_5/bias:0': 'v/dense_3/bias:0'}
-
-
-
+ 
 
 
 class Trainer():
 
     def __init__(self):
 
-        # self.agent = Agent()
-        # if('ckpt_load_path' in para): 
-        #     self.agent.load_checkpoint(para.ckpt_load_path)
-
-
-        self.agent_old = Agent_old()
-        if('ckpt_load_path' in para): 
-            self.agent_old.load_checkpoint(para.ckpt_load_path)
-
-        layers_old = {}
-        for w in self.agent_old.weights:            
-            # print(f'w.name: {w.name}')
-            layers_old[w.name] = w.numpy()
-            # print(w.numpy())
-            # exit()
-
-        # print('------------')
         self.agent = Agent()
-        self.agent(tf.random.uniform(shape=[1, *para.img_shape, para.k]))
-        for w in self.agent.weights:          
-            if(w.name in layer_map): 
-                w.assign(layers_old[layer_map[w.name]])               
-                # print(f'copied: {w.name}')
+        if('ckpt_load_path' in para): 
+            self.agent.load_checkpoint(para.ckpt_load_path)
 
-        # exit()
-
-        # std = 0.4
-        # for w in self.agent.weights:
-        #     key = w.name[:-2]            
-        #     if(key == 'a_std'):
-        #         w.assign(tf.convert_to_tensor(np.array([std, std, std], dtype=np.float32)))
-                
-
-        # for w in self.agent.weights:
-        #     key = w.name[:-2]
-        #     if(key == 'a_std'): 
-        #         print(f'after a_std: {w}')
-
-        # exit()
+ 
+        
+        for w in self.agent.weights:
+            key = w.name[:-2]            
+            if(key == 'a_std'):
+                w.assign(tf.convert_to_tensor(np.array([para.a_std, para.a_std, para.a_std], dtype=np.float32)))
+                print(f'a_std: {w}')
+   
 
 
 
