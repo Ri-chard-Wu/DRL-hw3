@@ -7,7 +7,7 @@ from collections import deque
 import tensorflow.keras.backend as K
 import tensorflow as tf
 import importlib
-
+import shutil
 import cv2
 import os
 from PIL import Image
@@ -57,26 +57,26 @@ para = AttrDict({
     'img_shape': (84, 84),
 
 
-    'lr': 1e-4,
+    'lr': 2.5e-4,
     'gamma': 0.99,
     'gae_lambda': 0.95,
     'ppo_clip': 0.2,
-    'w_val': 0.5,
+    # 'w_val': 0.5,
     'w_ent': 0.01,
     'horizon': 256,
-    'epochs': 10,
+    'epochs': 15,
     'n_iters': int(1e7),
-    'batch_size': 128,
+    'batch_size': 256,
     'n_envs': 8,
 
     'save_period': 20,  
     'eval_period': 20,    
     'log_period': 5,
 
-    'a_std': 0.3, 
+    'a_std': [0.3, 0.2, 0.2], 
 
-    'ckpt_save_path': "ckpt/checkpoint4.h5",
-    'ckpt_load_path': "ckpt/checkpoint3.h5"
+    'ckpt_save_path': "ckpt/checkpoint8.h5",
+    'ckpt_load_path': "ckpt/checkpoint7.h5"
 })
 
 
@@ -120,6 +120,11 @@ class FrameSkipEnv:
 
 
 def save_frame(dir_name, name, frame):
+    if(not os.path.exists(dir_name)):
+        os.mkdir(dir_name)    
+    
+    # print(f'############# frame.shape: {frame.shape}')
+    frame = np.squeeze(frame)
     img = Image.fromarray(frame)
     img.save(os.path.join(dir_name, name))        
 
@@ -435,9 +440,12 @@ class Agent(tf.keras.Model):
         
    
             r = tf.exp(a_logP - a_logP_old) # (b,)                        
-            pol_loss = - tf.reduce_mean(tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv)) - tf.reduce_mean(tf.reduce_sum(ent, axis=-1))
+            pol_loss = - tf.reduce_mean(tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv)) - \
+                                        para.w_ent * tf.reduce_mean(tf.reduce_sum(ent, axis=-1))
  
+            # pol_loss = - tf.reduce_mean(tf.minimum(r * adv, tf.clip_by_value(r, 1-eps, 1+eps) * adv))
   
+
         pol_grads = tape.gradient(pol_loss, self.policy_net.trainable_variables)
         self.opt_pol.apply_gradients(zip(pol_grads, self.policy_net.trainable_variables))
 
@@ -517,8 +525,10 @@ class VecBuf():
         
         assert adv.shape == self.val[:-1].shape
 
-        self.adv = (adv - adv.mean()) / (adv.std() + 1e-8)  
+        # self.adv = (adv - adv.mean()) / (adv.std() + 1e-8)  
         self.ret = adv + self.val[:-1]
+        self.adv = (adv - adv.mean()) / (adv.std() + 1e-8)  
+
         # print(f'adv.shape: {adv.shape}')
         
     
@@ -600,7 +610,7 @@ class Trainer():
         for w in self.agent.weights:
             key = w.name[:-2]            
             if(key == 'a_std'):
-                w.assign(tf.convert_to_tensor(np.array([para.a_std, para.a_std, para.a_std], dtype=np.float32)))
+                w.assign(tf.convert_to_tensor(np.array(para.a_std, dtype=np.float32)))
                 print(f'a_std: {w}')
    
 
@@ -658,8 +668,8 @@ class Trainer():
                                         self.compute_cum_reward(data.rew, data.don)
 
                 # print(f'len(losses): {len(losses)}')
-                log['pol_loss'] = np.mean(pol_losses)
-                log['val_loss'] = np.mean(val_losses)
+                log['pol_loss'] = np.mean(pol_losses).round(4)
+                log['val_loss'] = np.mean(val_losses).round(4)
                 with open("log.txt", "a") as f: f.write(f't: {t}, ' + str(log) + '\n')
 
             if t % para.eval_period == 0:
@@ -671,10 +681,13 @@ class Trainer():
 
     def compute_cum_reward(self, rew, don):  
         cum_rewards = [np.sum(rew[j]) for j in range(para.n_envs)]
-        return np.mean(cum_rewards), np.std(cum_rewards)
+        return np.mean(cum_rewards).round(4), np.std(cum_rewards).round(4)
  
 
-    def evaluate(self, t=0):
+
+
+
+    def evaluate(self, t=0, n=5):
 
         print('evaluating...')
     
@@ -683,13 +696,11 @@ class Trainer():
             use_ego_color=False)       
         
         total_rewards = []
-        for i in range(5):
-
-            obs = env.reset()
-
-           
+        for i in range(n):
+ 
+            obs = env.reset()           
             total_reward = 0
-            # step = 0
+            
             while True:
  
                 a = self.agent.act(obs) 
@@ -697,19 +708,55 @@ class Trainer():
                 
                 total_reward += reward[0]
 
-                # save_frame('video', f't-{t}-step{step}.jpeg', obs)
-                # step += 1
                 if done: break
- 
-            total_rewards.append(total_reward) 
 
-        return np.mean(total_rewards)
+            total_rewards.append(total_reward) 
+        return np.mean(total_rewards).round(4)
+
+
+
+    # def evaluate(self, t=0, n=5):
+
+    #     print('evaluating...')
+    
+    #     env = gym.make("MultiCarRacing-v0", num_agents=1, direction='CCW',
+    #         use_random_direction=True, backwards_flag=True, h_ratio=0.25,
+    #         use_ego_color=False)       
+        
+    #     total_rewards = []
+    #     for i in range(n):
+ 
+    #         dir_name = f"video/{i}"
+    #         if(os.path.exists(dir_name)):
+    #             shutil.rmtree(dir_name)
+
+
+    #         obs = env.reset()
+
+           
+    #         total_reward = 0
+    #         step = 0
+    #         while True:
+ 
+    #             a = self.agent.act(obs) 
+    #             obs, reward, done, _ = env.step(a)
+                
+    #             total_reward += reward[0]
+
+    #             save_frame(dir_name, f'{step}-r{int(reward)}.jpeg', obs)
+    #             # print(f'[{step}] a: {a}, reward: {reward}, done: {done}')
+    #             step += 1
+                
+    #             if done: break
+ 
+    #         total_rewards.append(total_reward) 
+    #         print(f'total_reward: {total_reward}')
+    #     return np.mean(total_rewards)
 
 
 
 
 trainer = Trainer()
 trainer.train()
-# trainer.evaluate()
-
+# trainer.evaluate(n=5)
 
