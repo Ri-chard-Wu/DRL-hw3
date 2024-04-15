@@ -57,15 +57,15 @@ para = AttrDict({
     'img_shape': (84, 84),
 
 
-    'lr': 1.0e-4,
+    'lr': 1e-4,
     'gamma': 0.99,
     'gae_lambda': 0.95,
-    'ppo_clip': 0.15,
+    'ppo_clip': 0.1,
     'w_ent': 0.01,
     'horizon': 256,
-    'epochs': 15,
+    'epochs': 20,
     'n_iters': int(1e7),
-    'batch_size': 256,
+    'batch_size': 512,
     'n_envs': 8,
 
     'save_period': 20,  
@@ -74,8 +74,8 @@ para = AttrDict({
 
     'a_std': [0.3, 0.2, 0.2], 
 
-    'ckpt_save_path': "ckpt/checkpoint10.h5",
-    'ckpt_load_path': "ckpt/checkpoint9.h5"
+    'ckpt_save_path': "ckpt/checkpoint11.h5",
+    'ckpt_load_path': "ckpt/eval-1060.h5"
 })
 
 
@@ -631,11 +631,26 @@ class Trainer():
 
             buf = VecBuf(para.n_envs)
          
-            for _ in range(para.horizon): 
+            for s in range(para.horizon): 
                 sta = buf.add_frame(obs) 
                 # print(f'buf.n: {buf.n}')
                 a, a_logP, value = self.agent.predict(sta) 
                 obs, reward, done, _ = env.step(a)
+
+                
+
+                # green penalty               
+                for i, ob in enumerate(obs):
+                    # print(f'ob.shape: {ob.shape}, reward.shape: {reward.shape}')
+                    gp = np.mean(ob[:, :, 1])
+                    
+                    if gp > 180.0:  
+                        reward[i] -= 0.05                  
+                        # print(f'gp: {gp}')
+
+                        # save_frame('video/gp', f'{t}-{s}-{i}_gp{int(gp)}.jpeg', ob)                        
+                   
+                                    
                 buf.add_value(value)
                 buf.add_effects(a, a_logP, reward, done)
              
