@@ -57,16 +57,15 @@ para = AttrDict({
     'img_shape': (84, 84),
 
 
-    'lr': 1e-4,
+    'lr': 1.0e-4,
     'gamma': 0.99,
     'gae_lambda': 0.95,
-    'ppo_clip': 0.1,
-    # 'w_val': 0.5,
+    'ppo_clip': 0.15,
     'w_ent': 0.01,
     'horizon': 256,
-    'epochs': 20,
+    'epochs': 15,
     'n_iters': int(1e7),
-    'batch_size': 512,
+    'batch_size': 256,
     'n_envs': 8,
 
     'save_period': 20,  
@@ -75,8 +74,8 @@ para = AttrDict({
 
     'a_std': [0.3, 0.2, 0.2], 
 
-    'ckpt_save_path': "ckpt/checkpoint9.h5",
-    'ckpt_load_path': "ckpt/checkpoint8.h5"
+    'ckpt_save_path': "ckpt/checkpoint10.h5",
+    'ckpt_load_path': "ckpt/checkpoint9.h5"
 })
 
 
