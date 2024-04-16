@@ -61,12 +61,14 @@ para = AttrDict({
     'gamma': 0.99,
     'gae_lambda': 0.95,
     'ppo_clip': 0.1,
-    'w_ent': 0.01,
-    'horizon': 256,
+    'w_ent': 0.01,    
     'epochs': 20,
     'n_iters': int(1e7),
-    'batch_size': 512,
-    'n_envs': 8,
+    'batch_size': 256,
+
+    'horizon': 128,
+    'n_envs': 16,
+    'groups': 2,
 
     'save_period': 20,  
     'eval_period': 20,    
@@ -74,8 +76,8 @@ para = AttrDict({
 
     'a_std': [0.3, 0.2, 0.2], 
 
-    'ckpt_save_path': "ckpt/checkpoint11.h5",
-    'ckpt_load_path': "ckpt/eval-1060.h5"
+    'ckpt_save_path': "ckpt/checkpoint12.h5",
+    'ckpt_load_path': "ckpt/checkpoint11.h5"
 })
 
 
@@ -139,38 +141,34 @@ def make_env():
     return env
  
  
-def worker(i, remote, parent_remote, env_fn_wrapper):
+def worker(id, remote, parent_remote, env_fn_wrapper):
+ 
     parent_remote.close()
-    env = env_fn_wrapper.x()
-    # t=0
+   
+    envs = [env_fn_wrapper.x() for i in range(para.groups)]
+ 
     while True:
+
         cmd, data = remote.recv()
+
         if cmd == 'step':
 
-            ob, reward, done, info = env.step(data)
+            out = []
+            for i in range(para.groups): 
+                ob, reward, done, info = envs[i].step(data[i]) 
+                if done: ob = envs[i].reset() 
 
-            if done:
-                ob = env.reset()
+                out.append((ob, reward, done, info))         
+            remote.send(out)
 
-            
-            # if(i==2): 
-            #     # print(f'[c] step recv {data}')
-            #     # print(f'[c] step send {(reward, done, info)}')
-            #     t+=1
-            #     save_frame('video/ps', f'step{t}.jpeg', ob)
-
-
-            remote.send((ob, reward, done, info))
         elif cmd == 'reset':
-            ob = env.reset()     
-            remote.send(ob)
-        elif cmd == 'render':
-            remote.send(env.render(mode='rgb_array'))
-        elif cmd == 'close':
-            remote.close()
-            break
-        elif cmd == 'get_spaces':
-            remote.send((env.observation_space, env.action_space))
+            
+            out = []
+            for i in range(para.groups): 
+                ob = envs[i].reset()  
+                out.append(ob)   
+            remote.send(out)
+    
         else:
             raise NotImplementedError
 
@@ -207,35 +205,31 @@ class VecEnv():
         
     def step(self, actions): # actions: (n_env, n_actions) numpy array.
 
-        # for remote, action in zip(self.remotes, actions):
-        #     remote.send(('step', action))
-
         for i in range(len(self.remotes)):
-            # if(i==2): print(f'[p] step {actions[i]}')
-            self.remotes[i].send(('step', actions[i]))
+            self.remotes[i].send(('step', actions[i*para.groups:(i+1)*para.groups]))
         
-        results = [remote.recv() for remote in self.remotes]
+        results = []
+        for remote in self.remotes:
+            recv = remote.recv()
+            results.extend(recv)
 
-        # print(f'[p] step recv {results[2][1:]}')
-        # print('-----------')
-        obs, rews, dones, infos = zip(*results)
-
-        # print(f'np.stack(rews).shape: {np.stack(rews).shape}')
-        # exit()
+        obs, rews, dones, infos = zip(*results)      
 
         return np.stack(obs), np.stack(rews), np.stack(dones), infos
+
 
     def reset(self):
         for remote in self.remotes:
             remote.send(('reset', None))
 
-        obs = np.stack([remote.recv() for remote in self.remotes])
-
-        # print(f'obs.shape: {obs.shape}')
-        # exit()
-
+        results = []
+        for remote in self.remotes:
+            recv = remote.recv() 
+            results.extend(recv) 
+        obs = np.stack(results)         
         return obs
  
+
     def close(self):
         if self.closed:
             return
@@ -617,7 +611,7 @@ class Trainer():
 
     def train(self):    
 
-        env = VecEnv([make_env for _ in range(para.n_envs)])
+        env = VecEnv([make_env for _ in range(para.n_envs // para.groups)])
         obs = env.reset()
     
  
