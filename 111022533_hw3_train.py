@@ -53,7 +53,7 @@ class AttrDict(dict):
 para = AttrDict({
     
     'k': 4,
-    'skip': 4,
+    'skip': 2,
     'img_shape': (84, 84),
 
 
@@ -64,20 +64,20 @@ para = AttrDict({
     'w_ent': 0.01,    
     'epochs': 20,
     'n_iters': int(1e7),
-    'batch_size': 256,
+    'batch_size': 512,
 
-    'horizon': 128,
-    'n_envs': 16,
-    'groups': 2,
+    'horizon': 256,
+    'n_envs': 8,
+    'groups': 1,
 
     'save_period': 20,  
     'eval_period': 20,    
     'log_period': 5,
 
-    'a_std': [0.3, 0.2, 0.2], 
+    'a_std': [0.25, 0.15, 0.15], 
 
-    'ckpt_save_path': "ckpt/checkpoint12.h5",
-    'ckpt_load_path': "ckpt/checkpoint11.h5"
+    'ckpt_save_path': "ckpt/checkpoint13-4.h5",
+    'ckpt_load_path': "ckpt/checkpoint12-2.h5"
 })
 
 
