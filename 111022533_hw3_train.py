@@ -77,7 +77,8 @@ para = AttrDict({
     'a_std': [0.25, 0.15, 0.15], 
 
     'ckpt_save_path': "ckpt/checkpoint13-4.h5",
-    'ckpt_load_path': "ckpt/checkpoint12-2.h5"
+    # 'ckpt_load_path': "ckpt/checkpoint12-2.h5"
+    'ckpt_load_path': "ckpt/eval-320.h5"
 })
 
 
@@ -718,7 +719,12 @@ class Trainer():
 
                 if done: break
 
+            
+
             total_rewards.append(total_reward) 
+
+            print(f'i: {i}, total_reward: {total_reward.round(4)}, np.mean(total_rewards): {np.mean(total_rewards).round(4)}')
+
         return np.mean(total_rewards).round(4)
 
 
@@ -765,6 +771,6 @@ class Trainer():
 
 
 trainer = Trainer()
-trainer.train()
-# trainer.evaluate(n=5)
+# trainer.train()
+trainer.evaluate(n=50)
 
