@@ -10,28 +10,8 @@ import importlib
 import shutil
 import cv2
 import os
-from PIL import Image
-# env = gym.make("MultiCarRacing-v0", num_agents=1, direction='CCW',
-#         use_random_direction=True, backwards_flag=True, h_ratio=0.25,
-#         use_ego_color=False)
-
-# obs = env.reset()
-# done = False
-# total_reward = 0
- 
-# num_actions = env.action_space.shape[0]
-# a_min = env.action_space.low
-# a_max = env.action_space.high
-
-# print(f'num_actions: {num_actions}, a_min: {a_min}, a_max: {a_max}')
-
-# while not done: 
-#   action = np.array([0, 1, 0] )
-#   obs, reward, done, info = env.step(action)
-#   total_reward += reward
-# print("individual scores:", total_reward)
-
-
+import sys
+from PIL import Image 
  
 
 
@@ -772,5 +752,21 @@ class Trainer():
 
 trainer = Trainer()
 # trainer.train()
+
+
+
+
+
+
+
+test_file = '111022533_hw3_test.py'
+module_name = '111022533_hw3_test'
+spec = importlib.util.spec_from_file_location(module_name, test_file)
+module = importlib.util.module_from_spec(spec)
+sys.modules[module_name] = module
+ 
+spec.loader.exec_module(module)
+Agent = getattr(module, 'Agent')
+
 trainer.evaluate(n=50)
 

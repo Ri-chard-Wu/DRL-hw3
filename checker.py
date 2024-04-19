@@ -1,7 +1,7 @@
 
 import os
 import importlib
-import torch
+# import torch
 import gym
 import sys
 import numpy as np
@@ -14,7 +14,8 @@ def check_file_integrity(foldernames):
         if not os.path.isdir(file) and "_hw3" in file:
             checking_list.append(file.split("_")[2])
  
-    elements = ["data.py","test.py","report.pdf","train.py"]
+    # elements = ["data.py","test.py","report.pdf","train.py"]
+    elements = ["data","test.py","train.py"]
     
     for name in elements:
         if name not in checking_list:
