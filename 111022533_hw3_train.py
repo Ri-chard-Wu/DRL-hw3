@@ -767,6 +767,6 @@ sys.modules[module_name] = module
  
 spec.loader.exec_module(module)
 Agent = getattr(module, 'Agent')
-
+trainer.agent = Agent()
 trainer.evaluate(n=50)
 
