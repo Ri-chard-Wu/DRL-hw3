@@ -6,6 +6,8 @@ import gym
 import sys
 import numpy as np
 import inspect
+import gym_multi_car_racing
+
 
 def check_file_integrity(foldernames):
 
@@ -14,7 +16,6 @@ def check_file_integrity(foldernames):
         if not os.path.isdir(file) and "_hw3" in file:
             checking_list.append(file.split("_")[2])
  
-    # elements = ["data.py","test.py","report.pdf","train.py"]
     elements = ["data","test.py","train.py"]
     
     for name in elements:
@@ -78,7 +79,7 @@ def check_agent_act(Agent):
 
 def check_data_form(Agent):
 
-    observation_space = gym.spaces.Box(0, 255, [96,96, 3],dtype=np.int64)
+    observation_space = gym.spaces.Box(0, 255, [1, 96,96, 3],dtype=np.uint8)
     test_obs = observation_space.sample()
     agent = Agent() 
 
@@ -97,6 +98,30 @@ def check_data_form(Agent):
     return True
 
 
+def check_one_episode(Agent):
+
+    env = gym.make("MultiCarRacing-v0", num_agents=1, direction='CCW',
+        use_random_direction=True, backwards_flag=True, h_ratio=0.25,
+        use_ego_color=False)
+
+    agent = Agent()
+    observation = env.reset()
+    done = False
+    total_reward = 0
+
+    while not done:
+        try:
+            action = agent.act(observation)
+        except Exception as e:
+            print(e)
+            print(f"\033[91mAgent CANNOT HANDLE CORRECT OBSERVATION FORM\033[0m")
+            return False
+        observation, reward, done, _ = env.step(action)
+        total_reward += reward
+    print(total_reward)
+    print(f"\033[92mEnv Run Checking: PASS +5\033[0m")
+    return True
+
 # main function
 def main():
 
@@ -114,7 +139,6 @@ def main():
         score += 5
     else:
         return
-
     
     Agent = check_agent(files)
     if Agent == None:
@@ -128,13 +152,12 @@ def main():
 
     if check_data_form(Agent):
         score += 5
-
-    # showing score
-        
-    print(f"\033[93mScore: {score}/20\033[0m")
     
- 
-          
+    if check_one_episode(Agent):
+        score += 5
+
+    # showing score    
+    print(f"\033[93mScore: {score}/25\033[0m")
 
 if __name__ == "__main__":
     main()

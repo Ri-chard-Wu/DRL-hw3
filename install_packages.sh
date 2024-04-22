@@ -16,7 +16,7 @@ apt-get install -y python-opengl
 apt install -y xvfb
 apt-get install -y libfontconfig1-dev
 
-# pip install opencv-python-headless
+pip install opencv-python-headless
 pip install pillow
 # Run with '''xvfb-run -s "-screen 0 1400x900x24" python 111022533_hw3_train.py'''
 
